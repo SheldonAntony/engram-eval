@@ -527,6 +527,11 @@ export const PreflightPlugin: Plugin = async () => {
       output.text = buildEnrichedPrompt(originalPrompt, taskType, similarTasks, memories, slots)
     },
 
+    // ── Re-inject after compaction — context was lost, treat as fresh session ──
+    "session.compacted": async (input: { sessionID: string }) => {
+      seenSessions.delete(input.sessionID)
+    },
+
     // ── Save task snapshots when session goes idle (task likely completed) ──
     "session.idle": async (input: { sessionID: string; lastMessage?: string }) => {
       if (!input.lastMessage) return
