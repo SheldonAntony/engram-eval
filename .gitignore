@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Database (local data, not committed)
+memory.db
+
+# Node
+node_modules/
+
+# OpenCode cache
+.cache/

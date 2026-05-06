@@ -1,0 +1,6 @@
+{
+  "retrievalConfidenceThreshold": 0.65,
+  "useLLMClassifier": true,
+  "anthropicApiKey": null,
+  "interactiveMode": true
+}
