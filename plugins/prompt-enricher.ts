@@ -48,6 +48,7 @@ const MEMORY_SCRIPT     = path.join(CONFIG_DIR, "memory.py")
 const TASKS_SCRIPT      = path.join(CONFIG_DIR, "tasks.py")
 const CLASSIFIER_SCRIPT = path.join(CONFIG_DIR, "classifier.py")
 const TRANSLATOR_SCRIPT = path.join(CONFIG_DIR, "translator.py")
+const EXTRACTOR_SCRIPT  = path.join(CONFIG_DIR, "extractor.py")
 const CONFIG_FILE       = path.join(CONFIG_DIR, "preflight.config.json")
 
 // ─── Config (Feature 4) ───────────────────────────────────────────────────────
@@ -276,6 +277,24 @@ async function classify(
   } catch { return null }
 }
 
+// ─── LLM council: session fact extraction ───────────────────────────────────────
+
+/**
+ * Run session summary through extractor.py (keyword + optional LLM council).
+ * Returns curated facts worth storing in long-term memory.
+ */
+async function extractFacts(
+  text: string,
+  apiKey: string | null,
+): Promise<string[]> {
+  try {
+    const payload = JSON.stringify({ text, apiKey })
+    const stdout  = await callPython([EXTRACTOR_SCRIPT, payload], 15_000)
+    const result  = JSON.parse(stdout.trim()) as { facts?: string[] }
+    return result.facts ?? []
+  } catch { return [] }
+}
+
 // ─── Intent-to-technical translation (Feature 8) ─────────────────────────────
 
 /** Slots whose values should be elicited via plain-language questions. */
@@ -473,8 +492,11 @@ function buildEnrichedPrompt(
 // ─── Plugin entry point ───────────────────────────────────────────────────────
 
 export const PreflightPlugin: Plugin = async () => {
-  const config    = loadConfig()
-  const projectId = getProjectId()
+  const config       = loadConfig()
+  const projectId    = getProjectId()
+  // #1: only enrich the first prompt of each session — follow-ups already have
+  // the context in the conversation window, no need to re-inject every time.
+  const seenSessions = new Set<string>()
 
   return {
     // ── Enrich every prompt before it reaches the LLM ──────────────────────
@@ -484,6 +506,13 @@ export const PreflightPlugin: Plugin = async () => {
     ) => {
       const sessionId      = input.sessionID
       const originalPrompt = output.text
+
+      // Store prompt in background regardless (always track what was asked)
+      storeSessionMessage(projectId, sessionId, originalPrompt).catch(() => {})
+
+      // #1: skip enrichment on follow-up messages — context already in window
+      if (seenSessions.has(sessionId)) return
+      seenSessions.add(sessionId)
 
       const [taskType, similarTasks, memories, fills] = await Promise.all([
         classify(originalPrompt, config.useLLMClassifier, config.anthropicApiKey),
@@ -496,17 +525,27 @@ export const PreflightPlugin: Plugin = async () => {
       for (const f of fills) slots[f.slot_name] = f.value
 
       output.text = buildEnrichedPrompt(originalPrompt, taskType, similarTasks, memories, slots)
-
-      // Store prompt as a memory fact in the background (non-blocking)
-      storeSessionMessage(projectId, sessionId, originalPrompt).catch(() => {})
     },
 
     // ── Save task snapshots when session goes idle (task likely completed) ──
     "session.idle": async (input: { sessionID: string; lastMessage?: string }) => {
       if (!input.lastMessage) return
-      const taskType = await classify(input.lastMessage, false, null)
+
+      // #4: LLM council — extract curated facts before storing anything
+      const [taskType, facts] = await Promise.all([
+        classify(input.lastMessage, false, null),
+        extractFacts(input.lastMessage, config.anthropicApiKey),
+      ])
+
+      // Store each council-approved fact in long-term memory
+      for (const fact of facts) {
+        storeMemory(projectId, input.sessionID, fact).catch(() => {})
+      }
+
+      // Also snapshot the task type + summary for weighted task retrieval
       if (taskType) {
-        await createTaskSnapshot(projectId, input.sessionID, taskType, "", input.lastMessage)
+        const summary = facts.length > 0 ? facts[0] : input.lastMessage
+        await createTaskSnapshot(projectId, input.sessionID, taskType, "", summary)
       }
     },
 
