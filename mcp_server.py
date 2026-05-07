@@ -162,21 +162,32 @@ def tool_get_context(
 
     # 2. Global memories (user preferences, cross-project conventions)
     try:
-        global_facts: list[str] = json.loads(
-            _call_memory("retrieve_facts", "__global__", session_id, prompt, "2", "0.25")
+        global_result = json.loads(
+            _call_memory("retrieve_facts", "__global__", session_id, prompt, "2", "0.25", "true")
         )
+        global_facts: list[str] = global_result.get("facts", []) if isinstance(global_result, dict) else global_result
+        global_budget_hit: bool = global_result.get("budget_hit", False) if isinstance(global_result, dict) else False
     except Exception:
         global_facts = []
+        global_budget_hit = False
 
     # 3. Project-specific memories
     try:
-        project_facts: list[str] = json.loads(
-            _call_memory("retrieve_facts", project_id, session_id, prompt, str(top_n), "0.25")
+        project_result = json.loads(
+            _call_memory("retrieve_facts", project_id, session_id, prompt, str(top_n), "0.25", "true")
         )
+        project_facts: list[str] = project_result.get("facts", []) if isinstance(project_result, dict) else project_result
+        project_budget_hit: bool = project_result.get("budget_hit", False) if isinstance(project_result, dict) else False
+        retrieved_count: int = project_result.get("retrieved_count", len(project_facts)) if isinstance(project_result, dict) else len(project_facts)
+        total_candidates: int = project_result.get("total_candidates", retrieved_count) if isinstance(project_result, dict) else retrieved_count
     except Exception:
         project_facts = []
+        project_budget_hit = False
+        retrieved_count = 0
+        total_candidates = 0
 
     memories = global_facts + project_facts
+    budget_hit = global_budget_hit or project_budget_hit
 
     # 4. Similar past tasks
     try:
@@ -204,11 +215,14 @@ def tool_get_context(
         pass
 
     return {
-        "memories":      memories,
-        "similar_tasks": similar_tasks,
-        "slots":         slots,
-        "task_type":     task_type,
-        "missing_slots": missing_slots,
+        "memories":        memories,
+        "similar_tasks":   similar_tasks,
+        "slots":           slots,
+        "task_type":       task_type,
+        "missing_slots":   missing_slots,
+        "budget_hit":      budget_hit,
+        "retrieved_count": retrieved_count,
+        "total_candidates": total_candidates,
     }
 
 

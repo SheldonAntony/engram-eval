@@ -65,8 +65,12 @@ def _direct_memory(*args):
         _mem.store_fact(project_id, session_id, text, fact_type)
         return ""
     elif cmd == "retrieve_facts":
-        _, project_id, session_id, prompt, top_n, threshold = args
-        return json.dumps(_mem.retrieve_facts(project_id, session_id, prompt, int(top_n), float(threshold)))
+        _, project_id, session_id, prompt, top_n, threshold, *extra = (*args, None, None)
+        include_budget = extra[0] == "true" if extra and extra[0] is not None else False
+        return json.dumps(_mem.retrieve_facts(
+            project_id, session_id, prompt, int(top_n), float(threshold),
+            include_budget_info=include_budget,
+        ))
     elif cmd == "store_slot_fill":
         _, project_id, session_id, slot_name, value = args
         _mem.store_slot_fill(project_id, session_id, slot_name, value)
@@ -326,6 +330,43 @@ try:
     check("graph expansion appends the connection pool neighbour",
           any("connection" in f.lower() or "pool" in f.lower() for f in facts),
           f"got: {facts}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test P5-COMPAT — retrieve_facts still returns list[str] by default
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test P5-COMPAT: retrieve_facts returns list by default ──")
+P5_PROJ = "p5_compat_proj"
+try:
+    _mem.store_fact(P5_PROJ, "sess_p5a", "we use Redis for caching sessions", "decision")
+    result_list = _mem.retrieve_facts(P5_PROJ, "sess_p5a", "Redis caching", top_n=3, threshold=0.0)
+    check("P5-COMPAT: default return is a list", isinstance(result_list, list),
+          f"got type: {type(result_list)}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test P5-OPT-IN — retrieve_facts returns dict when include_budget_info=True
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test P5-OPT-IN: retrieve_facts returns dict with budget info ──")
+try:
+    result_dict = _mem.retrieve_facts(
+        P5_PROJ, "sess_p5b", "Redis caching",
+        top_n=3, threshold=0.0, include_budget_info=True,
+    )
+    check("P5-OPT-IN: include_budget_info=True returns dict",
+          isinstance(result_dict, dict),
+          f"got type: {type(result_dict)}")
+    check("P5-OPT-IN: dict has 'facts' key",
+          "facts" in result_dict,
+          f"keys: {list(result_dict.keys()) if isinstance(result_dict, dict) else 'N/A'}")
+    check("P5-OPT-IN: dict has 'budget_hit' key",
+          "budget_hit" in result_dict,
+          f"keys: {list(result_dict.keys()) if isinstance(result_dict, dict) else 'N/A'}")
+    check("P5-OPT-IN: 'facts' value is a list",
+          isinstance(result_dict.get("facts"), list),
+          f"facts type: {type(result_dict.get('facts'))}")
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
