@@ -387,6 +387,28 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
+# ── Test 29: MMR diversity ────────────────────────────────────────────────────
+print("\n-- Test 29: MMR diversity --")
+MMR_PROJ = "mmr_test_proj"
+try:
+    for i in range(3):
+        _mem.store_fact(MMR_PROJ, "sess_mmr", f"we always use SQLAlchemy as our ORM layer version {i}", "decision")
+    _mem.store_fact(MMR_PROJ, "sess_mmr", "use async SQLAlchemy for all database connections", "decision")
+    _mem.store_fact(MMR_PROJ, "sess_mmr", "PostgreSQL is our production database", "decision")
+    results = _mem.retrieve_facts(MMR_PROJ, "sess_mmr2", "database ORM choice", top_n=3, threshold=0.1)
+    check("MMR: retrieve_facts returns a list", isinstance(results, list), f"got: {type(results)}")
+    if isinstance(results, list) and len(results) >= 2:
+        max_pair_sim = max(
+            _cos(_embed(results[i]), _embed(results[j]))
+            for i in range(len(results)) for j in range(i + 1, len(results))
+        )
+        check("MMR: top results not near-identical (sim < 0.99)", max_pair_sim < 0.99,
+              f"max pairwise sim={max_pair_sim:.3f}")
+    else:
+        check("MMR: got at least 2 results", len(results) >= 2, f"got {len(results)}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Summary
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
