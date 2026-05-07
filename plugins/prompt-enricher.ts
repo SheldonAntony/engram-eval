@@ -23,7 +23,6 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool }       from "@opencode-ai/plugin"
 import { execSync }   from "child_process"
 import { spawn }      from "child_process"
-import * as crypto    from "crypto"
 import * as fs        from "fs"
 import * as os        from "os"
 import * as path      from "path"
@@ -138,39 +137,33 @@ function callPython(args: string[], timeoutMs: number = 30_000): Promise<string>
   })
 }
 
-// ─── Deduplication helpers ────────────────────────────────────────────────────
+// ─── Session enrichment tracking (Bug 6) ────────────────────────────────────
 
-async function isDuplicate(key: string): Promise<boolean> {
+/**
+ * Returns true if this session has already received enrichment context.
+ * Persisted to SQLite so plugin restarts don’t re-inject stale context.
+ */
+async function sessionSeen(sessionId: string): Promise<boolean> {
   try {
-    const stdout = await callPython([MEMORY_SCRIPT, "check_dedup", key], 5_000)
-    return stdout.trim() === "EXISTS"
+    const stdout = await callPython([MEMORY_SCRIPT, "session_seen", sessionId], 5_000)
+    return stdout.trim() === "YES"
   } catch { return false }
 }
 
-async function markStored(key: string): Promise<void> {
+async function sessionMark(sessionId: string, projectId: string): Promise<void> {
   try {
-    await callPython([MEMORY_SCRIPT, "mark_stored", key], 5_000)
+    await callPython([MEMORY_SCRIPT, "session_mark", sessionId, projectId], 5_000)
+  } catch { /* silently ignore */ }
+}
+
+async function sessionUnmark(sessionId: string): Promise<void> {
+  try {
+    await callPython([MEMORY_SCRIPT, "session_unmark", sessionId], 5_000)
   } catch { /* silently ignore */ }
 }
 
 // ─── Memory functions ─────────────────────────────────────────────────────────
 
-/**
- * Store a message as a fact only if it has not been seen before
- * (deduplication via SHA-256 prefix key).
- */
-async function storeSessionMessage(
-  projectId: string,
-  sessionId: string,
-  text: string,
-): Promise<void> {
-  const key = crypto.createHash("sha256").update(text).digest("hex").slice(0, 16)
-  if (await isDuplicate(key)) return
-  try {
-    await callPython([MEMORY_SCRIPT, "store_fact", projectId, sessionId, text, "note"], 15_000)
-    await markStored(key)
-  } catch { /* silently ignore */ }
-}
 
 async function storeMemory(
   projectId: string,
@@ -248,11 +241,10 @@ async function storeSlotFill(
 
 async function retrieveSlotFills(
   projectId: string,
-  sessionId: string,
-): Promise<Array<{ session_id: string; slot_name: string; value: string }>> {
+): Promise<Array<{ slot_name: string; value: string }>> {
   try {
     const stdout = await callPython(
-      [MEMORY_SCRIPT, "retrieve_slot_fills", projectId, sessionId],
+      [MEMORY_SCRIPT, "retrieve_slot_fills", projectId],
       5_000,
     )
     return JSON.parse(stdout.trim()) ?? []
@@ -362,10 +354,10 @@ async function fillSlots(
   sendMessage: (text: string) => Promise<string | undefined>,
   config: PreflightConfig,
 ): Promise<SlotContext> {
-  const fills = await retrieveSlotFills(projectId, sessionId)
+  const fills = await retrieveSlotFills(projectId)
   const slots: SlotContext = {}
 
-  // Seed from stored fills
+  // Seed from stored fills — pre-filled slots are used silently, no confirmation
   for (const fill of fills) {
     slots[fill.slot_name] = fill.value
   }
@@ -374,20 +366,7 @@ async function fillSlots(
     return slots
   }
 
-  // Feature 6: confirm or correct each pre-filled slot
-  for (const fill of fills) {
-    const reply = await sendMessage(
-      `[pre-filled] ${fill.slot_name}: ${fill.value} (from previous session)\n` +
-      `Reply "ok" to accept, or type your correction:`,
-    )
-    if (reply && reply.trim().toLowerCase() !== "ok" && reply.trim() !== "") {
-      const corrected = reply.trim()
-      slots[fill.slot_name] = corrected
-      await storeSlotFill(projectId, sessionId, fill.slot_name, corrected)
-    }
-  }
-
-  // Feature 8: elicit missing technical slots.
+  // Elicit only genuinely missing technical slots.
   // With API key   → ask plain-language question, translate, confirm.
   // Without API key → ask direct technical question (zero-config mode).
   // Translation null (API failure) → fall back to direct question.
@@ -493,11 +472,8 @@ function buildEnrichedPrompt(
 // ─── Plugin entry point ───────────────────────────────────────────────────────
 
 export const PreflightPlugin: Plugin = async () => {
-  const config       = loadConfig()
-  const projectId    = getProjectId()
-  // #1: only enrich the first prompt of each session — follow-ups already have
-  // the context in the conversation window, no need to re-inject every time.
-  const seenSessions = new Set<string>()
+  const config    = loadConfig()
+  const projectId = getProjectId()
 
   return {
     // ── Enrich every prompt before it reaches the LLM ──────────────────────
@@ -508,18 +484,17 @@ export const PreflightPlugin: Plugin = async () => {
       const sessionId      = input.sessionID
       const originalPrompt = output.text
 
-      // Store prompt in background regardless (always track what was asked)
-      storeSessionMessage(projectId, sessionId, originalPrompt).catch(() => {})
-
-      // #1: skip enrichment on follow-up messages — context already in window
-      if (seenSessions.has(sessionId)) return
-      seenSessions.add(sessionId)
+      // Bug 6: persist enrichment state to SQLite so plugin restarts don't
+      // re-inject context that the conversation window already contains.
+      const seen = await sessionSeen(sessionId)
+      if (seen) return
+      await sessionMark(sessionId, projectId)
 
       const [taskType, similarTasks, memories, fills] = await Promise.all([
         classify(originalPrompt, config.useLLMClassifier, config.anthropicApiKey),
         retrieveSimilarTasks(projectId, sessionId, originalPrompt, config.retrievalConfidenceThreshold),
         retrieveMemory(projectId, sessionId, originalPrompt, config.retrievalConfidenceThreshold),
-        retrieveSlotFills(projectId, sessionId),
+        retrieveSlotFills(projectId),
       ])
 
       const slots: SlotContext = {}
@@ -530,7 +505,7 @@ export const PreflightPlugin: Plugin = async () => {
 
     // ── Re-inject after compaction — context was lost, treat as fresh session ──
     "session.compacted": async (input: { sessionID: string }) => {
-      seenSessions.delete(input.sessionID)
+      await sessionUnmark(input.sessionID)
     },
 
     // ── Save task snapshots when session goes idle (task likely completed) ──
@@ -589,43 +564,4 @@ export const PreflightPlugin: Plugin = async () => {
       }),
     },
   }
-}
-
-  plugin.on("chat.message", async (msg: unknown) => {
-    const message = msg as ChatMessage
-    const { sessionId, prompt } = message
-
-    try {
-      // Classify the task type (Feature 5)
-      const taskType = await classify(prompt, config.useLLMClassifier, config.anthropicApiKey)
-
-      // Retrieve relevant context in parallel
-      const [similarTasks, memories] = await Promise.all([
-        retrieveSimilarTasks(projectId, sessionId, prompt, config.retrievalConfidenceThreshold),
-        retrieveMemory(projectId, sessionId, prompt, config.retrievalConfidenceThreshold),
-      ])
-
-      // Fill slots with interactive confirmation (Features 6 + 8)
-      const slots = await fillSlots(
-        projectId, sessionId, prompt, message.reply.bind(message), config,
-      )
-
-      // Build enriched prompt and pass it on
-      const enriched = buildEnrichedPrompt(prompt, taskType, similarTasks, memories, slots)
-      message.setPrompt(enriched)
-
-      // Persist message for future retrieval (async, non-blocking for the chat)
-      void storeSessionMessage(projectId, sessionId, prompt)
-
-      // Create a task snapshot if we have a classification
-      if (taskType) {
-        void createTaskSnapshot(
-          projectId, sessionId, taskType, prompt, prompt.slice(0, 200),
-        )
-      }
-    } catch (err) {
-      // Never break the chat on enrichment failure — pass original prompt through
-      console.error("[preflight] enrichment error:", err)
-    }
-  })
 }

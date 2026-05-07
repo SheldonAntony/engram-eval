@@ -1,11 +1,22 @@
-## Preflight — Project Context
+## Preflight Memory — How To Use
 
-When the enriched prompt contains a `## Project context` section, use those slot values throughout your response.
+At the start of every session:
+1. Call `get_project_id` with your current working directory
+2. Call `get_context` with the user's first prompt, the session ID,
+   and the project ID
+3. Use the returned memories, similar_tasks, and slots as context
+4. For each slot in `missing_slots`, ask the user one plain-language
+   question and call `store_slot` with their answer before proceeding
 
-If that section is **missing slots** (framework, database, testing_framework, language, etc.) that are relevant to the task:
-1. Ask the user a single plain-language question for each missing slot
-2. Once they answer, call `preflight_store_slot` with the session ID, slot name, and value before proceeding
+During the session:
+- When the user states something important about the codebase,
+  architecture, or workflow: call `store_memory`
+- When the user corrects something you assumed: call `store_memory`
+  with the correction, then call `store_slot` if it is a config value
+- When the user states a personal preference (response style,
+  language preferences, conventions): call `store_memory` with
+  fact_type="preference" — this saves to global memory across projects
 
-When the user tells you something important about the codebase or workflow (architecture decisions, conventions, recurring patterns), call `preflight_store_memory` to save it.
-
-Do not ask for slots that are already in `## Project context` or that are clearly irrelevant to the current task.
+Do not ask for slots already returned in the `slots` field of `get_context`.
+Do not call `get_context` more than once per session unless the conversation
+window is compacted (in which case call it again on the next message).

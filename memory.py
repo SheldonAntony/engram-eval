@@ -2,12 +2,15 @@
 """Semantic memory and slot fills for the Preflight plugin.
 
 CLI usage:
-    memory.py store_fact      <project_id> <session_id> <text>
-    memory.py retrieve_facts  <project_id> <session_id> <prompt> [top_n] [threshold]
-    memory.py check_dedup     <key>
-    memory.py mark_stored     <key>
-    memory.py store_slot_fill <project_id> <session_id> <slot_name> <value>
-    memory.py retrieve_slot_fills <project_id> <session_id>
+    memory.py store_fact          <project_id> <session_id> <text> [fact_type]
+    memory.py retrieve_facts      <project_id> <session_id> <prompt> [top_n] [threshold]
+    memory.py check_dedup         <key>
+    memory.py mark_stored         <key>
+    memory.py store_slot_fill     <project_id> <session_id> <slot_name> <value>
+    memory.py retrieve_slot_fills <project_id>
+    memory.py session_seen        <session_id>
+    memory.py session_mark        <session_id> <project_id>
+    memory.py session_unmark      <session_id>
 """
 
 import json
@@ -70,6 +73,13 @@ def init_db() -> sqlite3.Connection:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id  TEXT PRIMARY KEY,
+            project_id  TEXT,
+            enriched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     # FTS5 keyword index (BM25) — half of the hybrid search.
     # Uses external rowid mapped to facts.id; manually kept in sync from store/update paths.
@@ -88,6 +98,15 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "fact_type",       "TEXT",      "'note'")
     _ensure_column(conn, "slot_fills", "project_id",      "TEXT",      "'unknown'")
     _ensure_column(conn, "slot_fills", "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
+
+    # Unique constraint so store_slot_fill can upsert instead of always inserting.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_slot_fills_project_slot "
+            "ON slot_fills (project_id, slot_name)"
+        )
+    except sqlite3.OperationalError:
+        pass  # index already exists
 
     # Backfill FTS5 index from any pre-existing facts (one-time, cheap if empty).
     fts_count = conn.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
@@ -337,32 +356,75 @@ def store_slot_fill(
 ) -> None:
     conn = init_db()
     conn.execute(
-        "INSERT INTO slot_fills (project_id, session_id, slot_name, value) VALUES (?, ?, ?, ?)",
+        """INSERT INTO slot_fills (project_id, session_id, slot_name, value)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(project_id, slot_name)
+           DO UPDATE SET value = excluded.value,
+                         session_id = excluded.session_id,
+                         created_at = CURRENT_TIMESTAMP""",
         (project_id, session_id, slot_name, value),
     )
     conn.commit()
     conn.close()
 
 
-def retrieve_slot_fills(
-    project_id: str, session_id: str
-) -> list[dict]:
-    """Feature 1 Bug 1: filter by both session_id and project_id."""
+def retrieve_slot_fills(project_id: str) -> list[dict]:
+    """Return the most recent value per slot for the given project.
+
+    Filters by project_id only so slot fills persist across sessions.
+    GROUP BY ensures one row per slot (the latest via HAVING MAX(created_at)).
+    """
     conn = init_db()
-    # Feature 1 Bug 1 fix: was missing session_id filter (fetched across ALL sessions)
     cursor = conn.execute(
-        """SELECT session_id, slot_name, value
+        """SELECT slot_name, value
            FROM slot_fills
-           WHERE session_id = ? AND project_id = ?
-           ORDER BY created_at DESC LIMIT 50""",
-        (session_id, project_id),
+           WHERE project_id = ?
+           GROUP BY slot_name
+           HAVING MAX(created_at)
+           ORDER BY created_at DESC""",
+        (project_id,),
     )
     rows = [
-        {"session_id": r[0], "slot_name": r[1], "value": r[2]}
+        {"slot_name": r[0], "value": r[1]}
         for r in cursor.fetchall()
     ]
     conn.close()
     return rows
+
+
+# ─── Session enrichment tracking ─────────────────────────────────────────────
+
+def session_seen(session_id: str) -> bool:
+    """Return True if this session has already been enriched."""
+    conn = init_db()
+    row = conn.execute(
+        "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def session_mark(session_id: str, project_id: str) -> None:
+    """Record that this session has been enriched."""
+    conn = init_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions (session_id, project_id) VALUES (?, ?)",
+        (session_id, project_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def session_unmark(session_id: str) -> None:
+    """Remove enrichment record so the next message triggers re-enrichment.
+
+    Called when a session is compacted — context was lost, so the next
+    message should receive fresh context injection.
+    """
+    conn = init_db()
+    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -406,8 +468,17 @@ if __name__ == "__main__":
         store_slot_fill(project_id, session_id, slot_name, value)
 
     elif cmd == "retrieve_slot_fills":
-        project_id, session_id = sys.argv[2], sys.argv[3]
-        print(json.dumps(retrieve_slot_fills(project_id, session_id)))
+        project_id = sys.argv[2]
+        print(json.dumps(retrieve_slot_fills(project_id)))
+
+    elif cmd == "session_seen":
+        print("YES" if session_seen(sys.argv[2]) else "NO")
+
+    elif cmd == "session_mark":
+        session_mark(sys.argv[2], sys.argv[3])
+
+    elif cmd == "session_unmark":
+        session_unmark(sys.argv[2])
 
     else:
         print(json.dumps({"error": f"Unknown command: {cmd}"}), file=sys.stderr)
