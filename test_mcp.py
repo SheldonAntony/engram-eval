@@ -93,6 +93,13 @@ def _direct_memory(*args):
         _, project_id, query, *rest = args
         depth = int(rest[0]) if rest else 1
         return json.dumps(_mem.get_graph(project_id, query, depth))
+    elif cmd == "get_history":
+        _, fact_id = args
+        return json.dumps(_mem.get_history(int(fact_id)))
+    elif cmd == "consolidate_memories":
+        _, project_id, *rest = args
+        session_id = rest[0] if rest else ""
+        return json.dumps(_mem.consolidate_memories(project_id, session_id))
     else:
         raise ValueError(f"Unknown CLI command in test: {cmd}")
 

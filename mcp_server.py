@@ -267,30 +267,48 @@ def tool_auto_extract(
     project_id: str,
     session_id: str,
 ) -> dict:
-    """Extract facts from an AI response and save them automatically.
+    """Extract facts from an AI response in a background thread.
 
-    Call this after every response with the full response text.
-    Non-blocking from the caller's perspective — any extraction failure
-    is silently swallowed so it never interrupts the conversation.
+    Returns {"status": "queued"} immediately — never blocks the conversation.
+    # I/O-bound: threading is safe here; switch to ProcessPoolExecutor if CPU-bound work is added.
+    """
+    import threading  # noqa: PLC0415
+
+    def _extract_and_store() -> None:
+        try:
+            raw = _run(
+                [EXTRACTOR_PY, json.dumps({"text": response_text, "apiKey": None})],
+                timeout=15,
+            )
+            facts: list[str] = json.loads(raw).get("facts", [])
+        except Exception:
+            facts = []
+        for fact in facts:
+            try:
+                _call_memory("store_fact", project_id, session_id, fact, "finding")
+            except Exception:
+                pass
+
+    threading.Thread(target=_extract_and_store, daemon=True).start()
+    return {"status": "queued"}
+
+
+def tool_consolidate_memories(
+    project_id: str,
+    session_id: str,
+) -> dict:
+    """Return the last 50 live facts for LLM-assisted memory consolidation.
+
+    Call after ~10 exchanges. Review the returned facts for contradictions
+    and redundancies, then call store_memory to update stale entries.
+    Contradiction syntax:
+      [CONTRADICTION DETECTED: Fact ID {id} \u2014 "{old_snippet}" superseded by "{new_snippet}"]
     """
     try:
-        raw = _run(
-            [EXTRACTOR_PY, json.dumps({"text": response_text, "apiKey": None})],
-            timeout=15,
-        )
-        facts: list[str] = json.loads(raw).get("facts", [])
-    except Exception:
-        facts = []
-
-    saved: list[str] = []
-    for fact in facts:
-        try:
-            _call_memory("store_fact", project_id, session_id, fact, "finding")
-            saved.append(fact)
-        except Exception:
-            pass
-
-    return {"extracted": len(saved), "facts": saved}
+        raw = _call_memory("consolidate_memories", project_id, session_id)
+        return json.loads(raw)
+    except Exception as exc:
+        return {"error": str(exc), "facts": [], "count": 0}
 
 
 def tool_get_graph(
@@ -450,6 +468,22 @@ def _build_mcp_server() -> "Server":
                     "required": ["fact_content", "project_id"],
                 },
             ),
+            mcp_types.Tool(
+                name="consolidate_memories",
+                description=(
+                    "Return the last 50 live facts for LLM-assisted consolidation. "
+                    "Call after ~10 exchanges to review stored memories for contradictions "
+                    "and redundancies. Then call store_memory to update or remove stale facts."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                    },
+                    "required": ["project_id", "session_id"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -494,6 +528,11 @@ def _build_mcp_server() -> "Server":
                     project_id=arguments["project_id"],
                     depth=arguments.get("depth", 1),
                 )
+            elif name == "consolidate_memories":
+                result = tool_consolidate_memories(
+                    project_id=arguments["project_id"],
+                    session_id=arguments["session_id"],
+                )
             else:
                 result = {"error": f"Unknown tool: {name}"}
         except Exception as exc:
@@ -527,6 +566,33 @@ def _warmup_embeddings() -> None:
         print(f"[preflight] embedding warmup failed: {exc}", file=sys.stderr)
 
 
+def _warmup_nlp() -> None:
+    """Pre-load the spaCy model at startup to avoid first-call latency (Phase 3)."""
+    try:
+        if str(_SCRIPTS_DIR) not in sys.path:
+            sys.path.insert(0, str(_SCRIPTS_DIR))
+        from extractor import _warmup_nlp as _wnlp  # noqa: PLC0415
+        _wnlp()
+        print("[preflight] spaCy model ready", file=sys.stderr)
+    except Exception as exc:
+        print(f"[preflight] spaCy warmup skipped: {exc}", file=sys.stderr)
+
+
+def _warmup_cross_encoder() -> None:
+    """Pre-load the MS-MARCO cross-encoder at startup (Phase 4, ~22MB)."""
+    try:
+        if str(_SCRIPTS_DIR) not in sys.path:
+            sys.path.insert(0, str(_SCRIPTS_DIR))
+        from utils import get_cross_encoder  # noqa: PLC0415
+        enc = get_cross_encoder()
+        if enc is not None:
+            print("[preflight] cross-encoder ready", file=sys.stderr)
+        else:
+            print("[preflight] cross-encoder not installed (optional)", file=sys.stderr)
+    except Exception as exc:
+        print(f"[preflight] cross-encoder warmup skipped: {exc}", file=sys.stderr)
+
+
 def main() -> None:
     if not _MCP_AVAILABLE:
         print(
@@ -536,6 +602,8 @@ def main() -> None:
         sys.exit(1)
 
     _warmup_embeddings()
+    _warmup_nlp()
+    _warmup_cross_encoder()
 
     import asyncio
     asyncio.run(_run_server())
