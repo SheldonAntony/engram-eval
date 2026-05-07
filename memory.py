@@ -63,6 +63,19 @@ RELATION_TYPES: dict[str, float] = {
     "depends_on":  0.8,
 }
 
+# Phase A: importance scoring weights and keyword signals.
+_IMPORTANCE_TYPE_WEIGHTS: dict[str, float] = {
+    "decision": 1.0, "preference": 0.9, "finding": 0.7,
+    "snippet": 0.5, "summary": 0.4, "note": 0.3,
+}
+_IMPORTANCE_KEYWORDS: frozenset = frozenset({
+    "never", "always", "must", "critical", "required", "forbidden",
+    "breaking", "security", "auth", "production", "prod", "deprecated",
+    "migration", "decided", "architectural",
+})
+# Phase C: MMR trade-off between relevance and diversity (0=diversity, 1=relevance).
+_MMR_LAMBDA = 0.6
+
 
 # ─── Database init ────────────────────────────────────────────────────────────
 
@@ -151,6 +164,7 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "last_retrieved_at", "REAL",      "NULL")
     _ensure_column(conn, "facts",      "interval_days",     "REAL",      "1.0")
     _ensure_column(conn, "facts",      "entities",          "TEXT",      "NULL")
+    _ensure_column(conn, "facts",      "importance",        "REAL",      "0.5")
     _ensure_column(conn, "slot_fills", "project_id",        "TEXT",      "'unknown'")
     _ensure_column(conn, "slot_fills", "created_at",        "TIMESTAMP", "CURRENT_TIMESTAMP")
 
@@ -449,8 +463,16 @@ def store_fact(project_id: str, session_id: str, text: str,
             best_id = row_id
 
     source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
-    ents_json = json.dumps(_extract_entities(text))
+    entities = _extract_entities(text)
+    ents_json = json.dumps(entities)
     emb_blob = _encode_embedding(emb)
+    # Phase A: importance scoring
+    type_weight = _IMPORTANCE_TYPE_WEIGHTS.get(fact_type, 0.3)
+    words = text.split()
+    entity_density = min(len(entities) / max(len(words), 1) * 5, 1.0)
+    kw_boost = 0.2 if any(kw in text.lower() for kw in _IMPORTANCE_KEYWORDS) else 0.0
+    importance = min(1.0, type_weight * 0.5 + entity_density * 0.3 + kw_boost * 0.2)
+    init_ef = max(1.3, 3.0 - importance)  # high importance -> shorter review interval
 
     if best_id is not None and best_sim >= _CONTRADICTION_THRESHOLD:
         # Soft-expire: record SUPERSEDE mutation, mark old row superseded, insert new row.
@@ -470,10 +492,10 @@ def store_fact(project_id: str, session_id: str, text: str,
         cur = conn.execute(
             """INSERT INTO facts
                (project_id, session_id, content, embedding, fact_type,
-                source_session, source_hash, entities)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_session, source_hash, entities, importance, easiness_factor)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (project_id, session_id, text, emb_blob, fact_type,
-             session_id, source_hash, ents_json),
+             session_id, source_hash, ents_json, round(importance, 4), round(init_ef, 4)),
         )
         saved_id = cur.lastrowid
         conn.execute(
@@ -484,10 +506,10 @@ def store_fact(project_id: str, session_id: str, text: str,
         cur = conn.execute(
             """INSERT INTO facts
                (project_id, session_id, content, embedding, fact_type,
-                source_session, source_hash, entities)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_session, source_hash, entities, importance, easiness_factor)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (project_id, session_id, text, emb_blob, fact_type,
-             session_id, source_hash, ents_json),
+             session_id, source_hash, ents_json, round(importance, 4), round(init_ef, 4)),
         )
         saved_id = cur.lastrowid
         conn.execute(
@@ -568,7 +590,8 @@ def retrieve_facts(
     # ── 1. Pull candidate pool (last 200 live facts) ───────────────────────
     cursor = conn.execute(
         """SELECT id, content, embedding, retrieval_count, created_at, fact_type,
-                  easiness_factor, last_retrieved_at, interval_days, entities
+                  easiness_factor, last_retrieved_at, interval_days, entities,
+                  COALESCE(importance, 0.5)
            FROM facts
            WHERE project_id = ?
              AND superseded_at IS NULL
@@ -577,7 +600,7 @@ def retrieve_facts(
         (project_id,),
     )
     rows: list = []
-    for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents in cursor.fetchall():
+    for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents, imp in cursor.fetchall():
         emb = _decode_embedding(emb_data)
         if emb is None:
             continue
@@ -588,6 +611,7 @@ def retrieve_facts(
             lra,
             ivd if ivd is not None else 1.0,
             ents,
+            imp if imp is not None else 0.5,
         ))
 
     if not rows:
@@ -602,10 +626,24 @@ def retrieve_facts(
     ).fetchone()
     max_rc = max_rc_row[0] if max_rc_row and max_rc_row[0] else 1
 
+    # Phase B: augment vector query with slot fills (BM25 uses bare prompt).
+    try:
+        slot_rows = conn.execute(
+            "SELECT slot_name, value FROM slot_fills WHERE project_id = ? LIMIT 5",
+            (project_id,),
+        ).fetchall()
+        augmented_prompt = (
+            " ".join(f"{k}={str(v)[:50]}" for k, v in slot_rows) + ": " + prompt
+            if slot_rows else prompt
+        )
+    except Exception:
+        augmented_prompt = prompt
+
     # ── 2. Vector ranking ──────────────────────────────────────────────────
-    prompt_emb = embed_text(prompt)
+    prompt_emb = embed_text(augmented_prompt)
+    emb_by_fid: dict[int, list] = {fid: emb for fid, _c, emb, *_ in rows}
     vec_scored = sorted(
-        ((cosine_similarity(prompt_emb, emb), fid) for fid, _c, emb, *_ in rows),
+        ((cosine_similarity(prompt_emb, emb), fid) for fid, emb in emb_by_fid.items()),
         reverse=True,
     )
     vec_rank: dict[int, int] = {fid: rank for rank, (_, fid) in enumerate(vec_scored)}
@@ -635,7 +673,7 @@ def retrieve_facts(
         prompt_ents = set(e.lower() for e in _extract_entities(prompt))
         if prompt_ents:
             ent_scores = []
-            for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json in rows:
+            for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp in rows:
                 try:
                     fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
                 except Exception:
@@ -663,7 +701,7 @@ def retrieve_facts(
     # ── 6. Combined score per fact ─────────────────────────────────────────
     now = datetime.now(timezone.utc)
     scored_all: list = []
-    for fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents in rows:
+    for fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents, imp in rows:
         rrf = (raw_rrf[fid] / max_rrf) if max_rrf > 0 else 0.0
         try:
             ca_dt = _parse_dt(ca)
@@ -674,7 +712,7 @@ def retrieve_facts(
         recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
         freq = (rc / max_rc) if max_rc > 0 else 0.0
         staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
-        score = 0.40 * rrf + 0.25 * recency + 0.15 * freq + 0.20 * staleness
+        score = 0.35 * rrf + 0.20 * recency + 0.15 * freq + 0.20 * staleness + 0.10 * imp
         # (score, fid, content, ef, lra, rc)
         scored_all.append((score, fid, content, ef, lra, rc))
     scored_all.sort(reverse=True, key=lambda x: x[0])
@@ -693,6 +731,32 @@ def retrieve_facts(
     due_scored = [row for row in scored_all if _is_due(row[1])]
     scored = due_scored if len(due_scored) >= 3 else scored_all
     total_candidates = len(scored)
+
+    # Phase C: MMR diversity — greedy select up to 20 diverse candidates for cross-encoder.
+    if len(scored) > 5:
+        selected_embs: list = []
+        mmr_selected: list = []
+        remaining = list(scored)
+        while remaining and len(mmr_selected) < 20:
+            best_ms, best_row = -1e9, None
+            for row in remaining:
+                cand_emb = emb_by_fid.get(row[1])
+                if cand_emb is None:
+                    continue
+                rel = cosine_similarity(prompt_emb, cand_emb)
+                redundancy = max(
+                    (cosine_similarity(cand_emb, s) for s in selected_embs),
+                    default=0.0,
+                )
+                ms = _MMR_LAMBDA * rel - (1.0 - _MMR_LAMBDA) * redundancy
+                if ms > best_ms:
+                    best_ms, best_row = ms, row
+            if best_row is None:
+                break
+            mmr_selected.append(best_row)
+            selected_embs.append(emb_by_fid[best_row[1]])
+            remaining.remove(best_row)
+        scored = mmr_selected + remaining
 
     # ── 8. Cross-encoder reranking (Phase 4) ──────────────────────────────
     # Reranks top-20 when sentence-transformers is loaded; 500ms latency cap.
