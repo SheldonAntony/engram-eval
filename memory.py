@@ -16,6 +16,7 @@ CLI usage:
     memory.py get_graph           <project_id> <query>
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -70,7 +71,25 @@ def init_db() -> sqlite3.Connection:
             embedding       TEXT,
             fact_type       TEXT DEFAULT 'note',
             retrieval_count INTEGER DEFAULT 0,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            valid_from      REAL DEFAULT (unixepoch()),
+            superseded_at   REAL DEFAULT NULL,
+            valid_to        REAL DEFAULT NULL,
+            source_session  TEXT,
+            source_hash     TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fact_mutations (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_id       INTEGER NOT NULL,
+            mutation_type TEXT NOT NULL,
+            old_content   TEXT,
+            new_content   TEXT,
+            mutated_at    REAL DEFAULT (unixepoch()),
+            session_id    TEXT,
+            FOREIGN KEY (fact_id) REFERENCES facts(id)
         )
     """)
     conn.execute("""
@@ -111,6 +130,11 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "retrieval_count", "INTEGER",   "0")
     _ensure_column(conn, "facts",      "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
     _ensure_column(conn, "facts",      "fact_type",       "TEXT",      "'note'")
+    _ensure_column(conn, "facts",      "valid_from",      "REAL",      "(unixepoch())")
+    _ensure_column(conn, "facts",      "superseded_at",   "REAL",      "NULL")
+    _ensure_column(conn, "facts",      "valid_to",        "REAL",      "NULL")
+    _ensure_column(conn, "facts",      "source_session",  "TEXT",      "NULL")
+    _ensure_column(conn, "facts",      "source_hash",     "TEXT",      "NULL")
     _ensure_column(conn, "slot_fills", "project_id",      "TEXT",      "'unknown'")
     _ensure_column(conn, "slot_fills", "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
 
@@ -150,6 +174,9 @@ def init_db() -> sqlite3.Connection:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_relations_b ON fact_relations(fact_id_b)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_facts_live ON facts (superseded_at, valid_to)"
     )
 
     # Backfill FTS5 index from any pre-existing facts (one-time, cheap if empty).
@@ -271,7 +298,11 @@ def get_graph(project_id: str, query: str, depth: int = 1) -> dict:
     """Find the closest fact for `query` and return it with its graph neighbourhood."""
     conn = init_db()
     cursor = conn.execute(
-        "SELECT id, content, embedding FROM facts WHERE project_id = ? ORDER BY id DESC LIMIT 200",
+        """SELECT id, content, embedding FROM facts
+           WHERE project_id = ?
+             AND superseded_at IS NULL
+             AND (valid_to IS NULL OR valid_to > unixepoch())
+           ORDER BY id DESC LIMIT 200""",
         (project_id,),
     )
     rows = cursor.fetchall()
@@ -323,6 +354,8 @@ def store_fact(project_id: str, session_id: str, text: str,
     cursor = conn.execute(
         """SELECT id, embedding FROM facts
            WHERE project_id = ?
+             AND superseded_at IS NULL
+             AND (valid_to IS NULL OR valid_to > unixepoch())
            ORDER BY id DESC LIMIT 200""",
         (project_id,),
     )
@@ -340,31 +373,50 @@ def store_fact(project_id: str, session_id: str, text: str,
             best_sim = sim
             best_id = row_id
 
+    source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+
     if best_id is not None and best_sim >= _CONTRADICTION_THRESHOLD:
-        # Replace the contradicted/duplicate fact in place.
+        # Soft-expire: record SUPERSEDE mutation, mark old row superseded, insert new row.
+        old_content_row = conn.execute(
+            "SELECT content FROM facts WHERE id = ?", (best_id,)
+        ).fetchone()
+        old_content = old_content_row[0] if old_content_row else ""
         conn.execute(
-            """UPDATE facts
-               SET content = ?, embedding = ?, fact_type = ?, session_id = ?
-               WHERE id = ?""",
-            (text, json.dumps(emb), fact_type, session_id, best_id),
+            """INSERT INTO fact_mutations (fact_id, mutation_type, old_content, new_content, session_id)
+               VALUES (?, 'SUPERSEDE', ?, ?, ?)""",
+            (best_id, old_content, text, session_id),
         )
-        # Keep the FTS5 mirror in sync.
-        conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (best_id,))
         conn.execute(
-            "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
-            (best_id, text),
+            "UPDATE facts SET superseded_at = unixepoch() WHERE id = ?",
+            (best_id,),
         )
-        saved_id = best_id
-    else:
         cur = conn.execute(
-            """INSERT INTO facts (project_id, session_id, content, embedding, fact_type)
-               VALUES (?, ?, ?, ?, ?)""",
-            (project_id, session_id, text, json.dumps(emb), fact_type),
+            """INSERT INTO facts
+               (project_id, session_id, content, embedding, fact_type, source_session, source_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, session_id, text, json.dumps(emb), fact_type, session_id, source_hash),
         )
         saved_id = cur.lastrowid
         conn.execute(
             "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
             (saved_id, text),
+        )
+    else:
+        cur = conn.execute(
+            """INSERT INTO facts
+               (project_id, session_id, content, embedding, fact_type, source_session, source_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, session_id, text, json.dumps(emb), fact_type, session_id, source_hash),
+        )
+        saved_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
+            (saved_id, text),
+        )
+        conn.execute(
+            """INSERT INTO fact_mutations (fact_id, mutation_type, new_content, session_id)
+               VALUES (?, 'INSERT', ?, ?)""",
+            (saved_id, text, session_id),
         )
 
     # ── Auto-link: create graph edges to semantically related existing facts ──
@@ -372,6 +424,8 @@ def store_fact(project_id: str, session_id: str, text: str,
     link_cursor = conn.execute(
         """SELECT id, content, embedding FROM facts
            WHERE project_id = ? AND id != ?
+             AND superseded_at IS NULL
+             AND (valid_to IS NULL OR valid_to > unixepoch())
            ORDER BY id DESC LIMIT 50""",
         (project_id, saved_id),
     )
@@ -418,11 +472,17 @@ def retrieve_facts(
     prompt: str,
     top_n: int = 3,
     threshold: float = 0.25,
-) -> list[str]:
+    include_budget_info: bool = False,
+    max_tokens: int = 2000,
+) -> "list[str] | dict":
     """Hybrid retrieval: BM25 + vector via Reciprocal Rank Fusion (RRF),
     then weighted with content-type-aware recency and frequency.
 
     Score = 0.5 * fused_rank + 0.3 * type_weighted_recency + 0.2 * frequency
+
+    When include_budget_info=True returns a dict with keys:
+      facts, budget_hit, retrieved_count, total_candidates
+    Otherwise returns list[str] for backward compatibility.
     """
     conn = init_db()
 
@@ -431,6 +491,8 @@ def retrieve_facts(
         """SELECT id, content, embedding, retrieval_count, created_at, fact_type
            FROM facts
            WHERE project_id = ?
+             AND superseded_at IS NULL
+             AND (valid_to IS NULL OR valid_to > unixepoch())
            ORDER BY id DESC LIMIT 200""",
         (project_id,),
     )
@@ -520,20 +582,33 @@ def retrieve_facts(
 
     scored.sort(reverse=True, key=lambda x: x[0])
 
-    # ── 5. Apply threshold and bump retrieval_count ───────────────────────
-    # Note: rrf scores are small (<0.04), so the historical 0.25 threshold
-    # mostly rejects via recency/freq contributions. Kept for compatibility.
+    # ── 5. Apply threshold and token budget, bump retrieval_count ─────────
+    total_candidates = len(scored)
     primary_ids: list[int] = []
     results: list[str] = []
-    content_by_id: dict[int, str] = {fid: content for _s, fid, content in scored}
-    for score, fid, content in scored[:top_n]:
-        if score >= threshold:
-            results.append(content)
-            primary_ids.append(fid)
-            conn.execute(
-                "UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE id = ?",
-                (fid,),
-            )
+    token_sum = 0
+    budget_hit = False
+    for score, fid, content in scored:
+        if score < threshold:
+            continue
+        if len(results) >= top_n:
+            break
+        # Estimate tokens: snippets are denser, others lighter.
+        fact_type_for_budget = next(
+            (ft for f2id, _c, _e, _rc, _ca, ft in rows if f2id == fid), "note"
+        )
+        multiplier = 1.8 if fact_type_for_budget == "snippet" else 1.3
+        token_est = int(len(content.split()) * multiplier)
+        if token_sum + token_est > max_tokens:
+            budget_hit = True
+            break
+        token_sum += token_est
+        results.append(content)
+        primary_ids.append(fid)
+        conn.execute(
+            "UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE id = ?",
+            (fid,),
+        )
 
     # ── 6. Graph expansion: append connected neighbours not already returned ─
     # Commit and close BEFORE graph expansion — get_related_facts() opens its own
@@ -555,7 +630,38 @@ def retrieve_facts(
                 seen_content.add(nc)
                 results.append(nc)
 
+    if include_budget_info:
+        return {
+            "facts": results,
+            "budget_hit": budget_hit,
+            "retrieved_count": len(results),
+            "total_candidates": total_candidates,
+        }
     return results
+
+
+def get_history(fact_id: int) -> list[dict]:
+    """Return the mutation log for a fact (INSERT, SUPERSEDE, etc.)."""
+    conn = init_db()
+    rows = conn.execute(
+        """SELECT id, mutation_type, old_content, new_content, mutated_at, session_id
+           FROM fact_mutations
+           WHERE fact_id = ?
+           ORDER BY mutated_at ASC""",
+        (fact_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "mutation_type": r[1],
+            "old_content": r[2],
+            "new_content": r[3],
+            "mutated_at": r[4],
+            "session_id": r[5],
+        }
+        for r in rows
+    ]
 
 
 # ─── Slot fills ───────────────────────────────────────────────────────────────
@@ -660,9 +766,14 @@ if __name__ == "__main__":
 
     elif cmd == "retrieve_facts":
         project_id, session_id, prompt = sys.argv[2], sys.argv[3], sys.argv[4]
-        top_n     = int(sys.argv[5])   if len(sys.argv) > 5 else 3
-        threshold = float(sys.argv[6]) if len(sys.argv) > 6 else 0.25
-        print(json.dumps(retrieve_facts(project_id, session_id, prompt, top_n, threshold)))
+        top_n            = int(sys.argv[5])       if len(sys.argv) > 5 else 3
+        threshold        = float(sys.argv[6])     if len(sys.argv) > 6 else 0.25
+        include_budget   = sys.argv[7] == "true"  if len(sys.argv) > 7 else False
+        max_tokens       = int(sys.argv[8])        if len(sys.argv) > 8 else 2000
+        print(json.dumps(retrieve_facts(
+            project_id, session_id, prompt, top_n, threshold,
+            include_budget_info=include_budget, max_tokens=max_tokens,
+        )))
 
     elif cmd == "check_dedup":
         print(check_dedup(sys.argv[2]))
