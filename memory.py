@@ -20,11 +20,19 @@ import hashlib
 import json
 import os
 import sqlite3
+import struct
 import sys
+import time
 from datetime import datetime, timezone
 
 # Feature 1 Bug 3: shared utilities extracted from this module
 from utils import cosine_similarity, embed_text
+
+try:
+    from extractor import extract_entities as _extract_entities
+except (ImportError, AttributeError):
+    def _extract_entities(text: str) -> list[str]:  # type: ignore[misc]
+        return []
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.db")
 
@@ -64,19 +72,23 @@ def init_db() -> sqlite3.Connection:
     # Feature 2: project_id column on all tables
     conn.execute("""
         CREATE TABLE IF NOT EXISTS facts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id      TEXT,
-            project_id      TEXT,
-            content         TEXT,
-            embedding       TEXT,
-            fact_type       TEXT DEFAULT 'note',
-            retrieval_count INTEGER DEFAULT 0,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            valid_from      REAL DEFAULT (unixepoch()),
-            superseded_at   REAL DEFAULT NULL,
-            valid_to        REAL DEFAULT NULL,
-            source_session  TEXT,
-            source_hash     TEXT
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id        TEXT,
+            project_id        TEXT,
+            content           TEXT,
+            embedding         BLOB,
+            fact_type         TEXT    DEFAULT 'note',
+            retrieval_count   INTEGER DEFAULT 0,
+            created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            valid_from        REAL    DEFAULT (unixepoch()),
+            superseded_at     REAL    DEFAULT NULL,
+            valid_to          REAL    DEFAULT NULL,
+            source_session    TEXT,
+            source_hash       TEXT,
+            easiness_factor   REAL    DEFAULT 2.5,
+            last_retrieved_at REAL    DEFAULT NULL,
+            interval_days     REAL    DEFAULT 1.0,
+            entities          TEXT    DEFAULT NULL
         )
     """)
 
@@ -130,13 +142,17 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "retrieval_count", "INTEGER",   "0")
     _ensure_column(conn, "facts",      "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
     _ensure_column(conn, "facts",      "fact_type",       "TEXT",      "'note'")
-    _ensure_column(conn, "facts",      "valid_from",      "REAL",      "(unixepoch())")
-    _ensure_column(conn, "facts",      "superseded_at",   "REAL",      "NULL")
-    _ensure_column(conn, "facts",      "valid_to",        "REAL",      "NULL")
-    _ensure_column(conn, "facts",      "source_session",  "TEXT",      "NULL")
-    _ensure_column(conn, "facts",      "source_hash",     "TEXT",      "NULL")
-    _ensure_column(conn, "slot_fills", "project_id",      "TEXT",      "'unknown'")
-    _ensure_column(conn, "slot_fills", "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
+    _ensure_column(conn, "facts",      "valid_from",        "REAL",      "(unixepoch())")
+    _ensure_column(conn, "facts",      "superseded_at",     "REAL",      "NULL")
+    _ensure_column(conn, "facts",      "valid_to",          "REAL",      "NULL")
+    _ensure_column(conn, "facts",      "source_session",    "TEXT",      "NULL")
+    _ensure_column(conn, "facts",      "source_hash",       "TEXT",      "NULL")
+    _ensure_column(conn, "facts",      "easiness_factor",   "REAL",      "2.5")
+    _ensure_column(conn, "facts",      "last_retrieved_at", "REAL",      "NULL")
+    _ensure_column(conn, "facts",      "interval_days",     "REAL",      "1.0")
+    _ensure_column(conn, "facts",      "entities",          "TEXT",      "NULL")
+    _ensure_column(conn, "slot_fills", "project_id",        "TEXT",      "'unknown'")
+    _ensure_column(conn, "slot_fills", "created_at",        "TIMESTAMP", "CURRENT_TIMESTAMP")
 
     # Unique constraint so store_slot_fill can upsert instead of always inserting.
     # Must deduplicate first — old insert-always behaviour may have left multiple
@@ -185,6 +201,20 @@ def init_db() -> sqlite3.Connection:
     if fts_count < facts_count:
         conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
 
+    # Phase 7: One-time migration — re-encode JSON embeddings as binary blobs.
+    # JSON rows are str; binary rows are bytes. Safe to run on every init_db():
+    # rows already migrated are bytes and are skipped by the isinstance check.
+    try:
+        for fid, emb_data in conn.execute(
+            "SELECT id, embedding FROM facts WHERE embedding IS NOT NULL"
+        ).fetchall():
+            if isinstance(emb_data, str):
+                vec = json.loads(emb_data)
+                blob = struct.pack(f"{len(vec)}f", *vec)
+                conn.execute("UPDATE facts SET embedding = ? WHERE id = ?", (blob, fid))
+    except Exception:
+        pass
+
     conn.commit()
     return conn
 
@@ -197,6 +227,24 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col: str,
         conn.execute(
             f"ALTER TABLE {table} ADD COLUMN {col} {col_type} DEFAULT {default}"
         )
+
+
+def _encode_embedding(vec: list[float]) -> bytes:
+    """Pack a float vector into a compact binary blob (struct.pack, 4 bytes/float)."""
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def _decode_embedding(blob) -> "list[float] | None":
+    """Unpack a binary blob or legacy JSON string into a float list."""
+    if blob is None:
+        return None
+    if isinstance(blob, (bytes, bytearray)):
+        n = len(blob) // 4
+        return list(struct.unpack(f"{n}f", blob))
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
 
 
 # ─── Deduplication ───────────────────────────────────────────────────────────
@@ -313,12 +361,9 @@ def get_graph(project_id: str, query: str, depth: int = 1) -> dict:
 
     query_emb = embed_text(query)
     best_id, best_content, best_sim = None, "", 0.0
-    for fid, content, emb_json in rows:
-        if not emb_json:
-            continue
-        try:
-            emb = json.loads(emb_json)
-        except (json.JSONDecodeError, TypeError):
+    for fid, content, emb_data in rows:
+        emb = _decode_embedding(emb_data)
+        if emb is None:
             continue
         sim = cosine_similarity(query_emb, emb)
         if sim > best_sim:
@@ -336,21 +381,54 @@ def get_graph(project_id: str, query: str, depth: int = 1) -> dict:
 
 # ─── Facts (semantic memory) ──────────────────────────────────────────────────
 
+_compacted_this_process = False
+
+
+def _compact_old_mutations(conn: sqlite3.Connection) -> None:
+    """Delete INSERT mutation log entries older than 90 days.
+
+    SUPERSEDE / EXPLICIT_EXPIRE events are kept forever for audit history.
+    """
+    cutoff = int(time.time()) - 90 * 86400
+    conn.execute(
+        "DELETE FROM fact_mutations WHERE mutation_type = 'INSERT' AND mutated_at < ?",
+        (cutoff,),
+    )
+
+
+def _get_cross_encoder():
+    """Lazy-load the MS-MARCO cross-encoder for Phase 4 reranking.
+
+    Returns None if sentence-transformers is not installed or the stub
+    utils module (used in tests) does not expose get_cross_encoder.
+    """
+    try:
+        from utils import get_cross_encoder  # noqa: PLC0415
+        return get_cross_encoder()
+    except (ImportError, AttributeError):
+        return None
+
+
 def store_fact(project_id: str, session_id: str, text: str,
                fact_type: str = "note") -> None:
-    """Store a fact, replacing near-duplicates instead of inserting them.
+    """Store a fact with soft-expire on contradiction, binary embedding, entity extraction.
 
-    Contradiction detection: if any existing fact in the same project has
-    cosine similarity >= _CONTRADICTION_THRESHOLD with the new text, we
-    overwrite that row in-place. This handles both verbatim duplicates and
-    paraphrased restatements (e.g. "we use Postgres" → "switched to MySQL"
-    when the latter is similar enough to the former).
+    Contradiction detection: cosine similarity >= _CONTRADICTION_THRESHOLD writes a
+    SUPERSEDE mutation, sets superseded_at on the old row, and inserts a new row.
+    Phase 3: extracted entities stored as JSON list for entity-overlap retrieval.
+    Phase 7: embeddings stored as compact binary blobs (struct.pack, 4 bytes/float).
+    Phase 7.5: old INSERT mutations (> 90 days) compacted once per process.
     """
+    global _compacted_this_process
     emb = embed_text(text)
     conn = init_db()
 
-    # Find the most-similar existing fact in this project (last 200 only —
-    # bounded for speed; older near-duplicates are acceptable to keep).
+    # Phase 7.5: compact old INSERT mutations once per process lifetime.
+    if not _compacted_this_process:
+        _compact_old_mutations(conn)
+        _compacted_this_process = True
+
+    # Find the most-similar live fact in this project (last 200).
     cursor = conn.execute(
         """SELECT id, embedding FROM facts
            WHERE project_id = ?
@@ -361,12 +439,9 @@ def store_fact(project_id: str, session_id: str, text: str,
     )
     best_id: int | None = None
     best_sim: float = 0.0
-    for row_id, emb_json in cursor.fetchall():
-        if not emb_json:
-            continue
-        try:
-            existing_emb = json.loads(emb_json)
-        except (json.JSONDecodeError, TypeError):
+    for row_id, emb_data in cursor.fetchall():
+        existing_emb = _decode_embedding(emb_data)
+        if existing_emb is None:
             continue
         sim = cosine_similarity(emb, existing_emb)
         if sim > best_sim:
@@ -374,6 +449,8 @@ def store_fact(project_id: str, session_id: str, text: str,
             best_id = row_id
 
     source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+    ents_json = json.dumps(_extract_entities(text))
+    emb_blob = _encode_embedding(emb)
 
     if best_id is not None and best_sim >= _CONTRADICTION_THRESHOLD:
         # Soft-expire: record SUPERSEDE mutation, mark old row superseded, insert new row.
@@ -392,9 +469,11 @@ def store_fact(project_id: str, session_id: str, text: str,
         )
         cur = conn.execute(
             """INSERT INTO facts
-               (project_id, session_id, content, embedding, fact_type, source_session, source_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (project_id, session_id, text, json.dumps(emb), fact_type, session_id, source_hash),
+               (project_id, session_id, content, embedding, fact_type,
+                source_session, source_hash, entities)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, session_id, text, emb_blob, fact_type,
+             session_id, source_hash, ents_json),
         )
         saved_id = cur.lastrowid
         conn.execute(
@@ -404,9 +483,11 @@ def store_fact(project_id: str, session_id: str, text: str,
     else:
         cur = conn.execute(
             """INSERT INTO facts
-               (project_id, session_id, content, embedding, fact_type, source_session, source_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (project_id, session_id, text, json.dumps(emb), fact_type, session_id, source_hash),
+               (project_id, session_id, content, embedding, fact_type,
+                source_session, source_hash, entities)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, session_id, text, emb_blob, fact_type,
+             session_id, source_hash, ents_json),
         )
         saved_id = cur.lastrowid
         conn.execute(
@@ -419,8 +500,7 @@ def store_fact(project_id: str, session_id: str, text: str,
             (saved_id, text, session_id),
         )
 
-    # ── Auto-link: create graph edges to semantically related existing facts ──
-    # Re-scan (now excluding the saved row itself) to find edges ≥ threshold.
+    # ── Auto-link: graph edges to semantically related existing facts ─────
     link_cursor = conn.execute(
         """SELECT id, content, embedding FROM facts
            WHERE project_id = ? AND id != ?
@@ -429,17 +509,13 @@ def store_fact(project_id: str, session_id: str, text: str,
            ORDER BY id DESC LIMIT 50""",
         (project_id, saved_id),
     )
-    for neighbor_id, neighbor_content, neighbor_emb_json in link_cursor.fetchall():
-        if not neighbor_emb_json:
-            continue
-        try:
-            neighbor_emb = json.loads(neighbor_emb_json)
-        except (json.JSONDecodeError, TypeError):
+    for neighbor_id, neighbor_content, neighbor_emb_data in link_cursor.fetchall():
+        neighbor_emb = _decode_embedding(neighbor_emb_data)
+        if neighbor_emb is None:
             continue
         sim = cosine_similarity(emb, neighbor_emb)
         if sim >= _RELATION_THRESHOLD:
             relation = _infer_relation(text, neighbor_content, sim)
-            # Store edge with smaller id first for canonical dedup
             id_a, id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
             conn.execute(
                 """INSERT OR IGNORE INTO fact_relations
@@ -475,20 +551,24 @@ def retrieve_facts(
     include_budget_info: bool = False,
     max_tokens: int = 2000,
 ) -> "list[str] | dict":
-    """Hybrid retrieval: BM25 + vector via Reciprocal Rank Fusion (RRF),
-    then weighted with content-type-aware recency and frequency.
+    """Hybrid BM25 + vector + entity-overlap retrieval via three-way RRF.
 
-    Score = 0.5 * fused_rank + 0.3 * type_weighted_recency + 0.2 * frequency
+    Score = 0.40*rrf + 0.25*recency + 0.15*freq + 0.20*staleness
 
-    When include_budget_info=True returns a dict with keys:
-      facts, budget_hit, retrieved_count, total_candidates
-    Otherwise returns list[str] for backward compatibility.
+    Phase 2 SM-2 gate: only facts whose spaced-repetition interval has elapsed
+    are ranked. Soft-relax: gate dropped when fewer than 3 facts would pass.
+    Phase 3: entity-overlap adds a third RRF signal.
+    Phase 4: cross-encoder reranks top-20 when sentence-transformers is loaded
+    (500ms latency cap; falls back to RRF-only on timeout or missing dep).
+    Phase 5: greedy token budget; returns list[str] or dict per include_budget_info.
     """
+    now_ts = time.time()
     conn = init_db()
 
-    # ── 1. Pull candidate pool (last 200 facts in project) ────────────────
+    # ── 1. Pull candidate pool (last 200 live facts) ───────────────────────
     cursor = conn.execute(
-        """SELECT id, content, embedding, retrieval_count, created_at, fact_type
+        """SELECT id, content, embedding, retrieval_count, created_at, fact_type,
+                  easiness_factor, last_retrieved_at, interval_days, entities
            FROM facts
            WHERE project_id = ?
              AND superseded_at IS NULL
@@ -496,18 +576,24 @@ def retrieve_facts(
            ORDER BY id DESC LIMIT 200""",
         (project_id,),
     )
-    rows: list[tuple[int, str, list[float], int, str, str]] = []
-    for fid, content, emb_json, rc, ca, ft in cursor.fetchall():
-        if not emb_json:
+    rows: list = []
+    for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents in cursor.fetchall():
+        emb = _decode_embedding(emb_data)
+        if emb is None:
             continue
-        try:
-            emb = json.loads(emb_json)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        rows.append((fid, content, emb, rc, ca, ft or "note"))
+        rows.append((
+            fid, content, emb,
+            rc or 0, ca, ft or "note",
+            ef if ef is not None else 2.5,
+            lra,
+            ivd if ivd is not None else 1.0,
+            ents,
+        ))
 
     if not rows:
         conn.close()
+        if include_budget_info:
+            return {"facts": [], "budget_hit": False, "retrieved_count": 0, "total_candidates": 0}
         return []
 
     max_rc_row = conn.execute(
@@ -516,23 +602,19 @@ def retrieve_facts(
     ).fetchone()
     max_rc = max_rc_row[0] if max_rc_row and max_rc_row[0] else 1
 
-    # ── 2. Vector ranking (cosine similarity) ─────────────────────────────
+    # ── 2. Vector ranking ──────────────────────────────────────────────────
     prompt_emb = embed_text(prompt)
     vec_scored = sorted(
-        (
-            (cosine_similarity(prompt_emb, emb), fid)
-            for fid, _c, emb, _rc, _ca, _ft in rows
-        ),
+        ((cosine_similarity(prompt_emb, emb), fid) for fid, _c, emb, *_ in rows),
         reverse=True,
-        key=lambda x: x[0],
     )
-    vec_rank: dict[int, int] = {fid: rank for rank, (_s, fid) in enumerate(vec_scored)}
+    vec_rank: dict[int, int] = {fid: rank for rank, (_, fid) in enumerate(vec_scored)}
 
-    # ── 3. BM25 ranking via FTS5 (returns lowest = best match) ────────────
+    # ── 3. BM25 via FTS5 ──────────────────────────────────────────────────
     bm25_rank: dict[int, int] = {}
     fts_query = _fts5_query(prompt)
     if fts_query:
-        candidate_ids = tuple(fid for fid, *_rest in rows)
+        candidate_ids = tuple(fid for fid, *_ in rows)
         placeholders = ",".join("?" for _ in candidate_ids)
         try:
             bm_cursor = conn.execute(
@@ -545,59 +627,111 @@ def retrieve_facts(
             for rank, (fid,) in enumerate(bm_cursor.fetchall()):
                 bm25_rank[fid] = rank
         except sqlite3.OperationalError:
-            # Malformed query or FTS5 unavailable — silently skip BM25 leg.
-            bm25_rank = {}
+            pass
 
-    # ── 4. RRF fusion + weighted scoring ──────────────────────────────────
-    # Standard RRF scores are tiny (~0.03 max) — normalize within the batch
-    # so the relevance leg is comparable to recency/freq.
-    K = 60
+    # ── 4. Entity-overlap ranking (Phase 3) ───────────────────────────────
+    entity_rank: dict[int, int] = {}
+    try:
+        prompt_ents = set(e.lower() for e in _extract_entities(prompt))
+        if prompt_ents:
+            ent_scores = []
+            for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json in rows:
+                try:
+                    fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
+                except Exception:
+                    fact_ents = set()
+                overlap = len(prompt_ents & fact_ents) / max(len(prompt_ents), len(fact_ents), 1)
+                ent_scores.append((overlap, fid))
+            ent_scores.sort(reverse=True)
+            entity_rank = {fid: rank for rank, (_, fid) in enumerate(ent_scores)}
+    except Exception:
+        pass
+
+    # ── 5. Three-way RRF fusion ────────────────────────────────────────────
+    _RRF_K = 60
+    n = len(rows)
     raw_rrf: dict[int, float] = {}
-    for fid, *_rest in rows:
-        s = 1.0 / (K + vec_rank.get(fid, len(rows)))
+    for fid, *_ in rows:
+        s = 1.0 / (_RRF_K + vec_rank.get(fid, n))
         if fid in bm25_rank:
-            s += 1.0 / (K + bm25_rank[fid])
+            s += 1.0 / (_RRF_K + bm25_rank[fid])
+        if fid in entity_rank:
+            s += 1.0 / (_RRF_K + entity_rank[fid])
         raw_rrf[fid] = s
     max_rrf = max(raw_rrf.values()) if raw_rrf else 1.0
 
+    # ── 6. Combined score per fact ─────────────────────────────────────────
     now = datetime.now(timezone.utc)
-    scored: list[tuple[float, int, str]] = []
-    for fid, content, _emb, rc, created_at, fact_type in rows:
+    scored_all: list = []
+    for fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents in rows:
         rrf = (raw_rrf[fid] / max_rrf) if max_rrf > 0 else 0.0
-
-        # Content-type-aware recency decay (decisions don't decay).
         try:
-            ca_dt = _parse_dt(created_at)
+            ca_dt = _parse_dt(ca)
         except Exception:
             ca_dt = now
         days = max(0, (now - ca_dt).days)
-        decay = _DECAY_RATES.get(fact_type, _DECAY_RATES["note"])
+        decay = _DECAY_RATES.get(ft, _DECAY_RATES["note"])
         recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
+        freq = (rc / max_rc) if max_rc > 0 else 0.0
+        staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
+        score = 0.40 * rrf + 0.25 * recency + 0.15 * freq + 0.20 * staleness
+        # (score, fid, content, ef, lra, rc)
+        scored_all.append((score, fid, content, ef, lra, rc))
+    scored_all.sort(reverse=True, key=lambda x: x[0])
 
-        # Frequency normalized by project max.
-        freq = (rc / max_rc) if max_rc > 0 else 0
+    # ── 7. SM-2 gate — soft relax when < 3 facts pass (Phase 2) ──────────
+    _lra_by_fid = {r[0]: r[7] for r in rows}
+    _ivd_by_fid = {r[0]: r[8] for r in rows}
 
-        combined = 0.5 * rrf + 0.3 * recency + 0.2 * freq
-        scored.append((combined, fid, content))
+    def _is_due(fid: int) -> bool:
+        lra = _lra_by_fid.get(fid)
+        ivd = _ivd_by_fid.get(fid, 1.0)
+        if lra is None:
+            return True
+        return (now_ts - lra) >= (ivd * 86400)
 
-    scored.sort(reverse=True, key=lambda x: x[0])
-
-    # ── 5. Apply threshold and token budget, bump retrieval_count ─────────
+    due_scored = [row for row in scored_all if _is_due(row[1])]
+    scored = due_scored if len(due_scored) >= 3 else scored_all
     total_candidates = len(scored)
+
+    # ── 8. Cross-encoder reranking (Phase 4) ──────────────────────────────
+    # Reranks top-20 when sentence-transformers is loaded; 500ms latency cap.
+    quality_by_fid: dict[int, float] = {}
+    try:
+        cross_enc = _get_cross_encoder()
+        if cross_enc is not None and len(scored) > 5:
+            top20 = scored[:20]
+            pairs = [(prompt, c) for _, _, c, *_ in top20]
+            t0 = time.time()
+            ce_raw = cross_enc.predict(pairs)
+            if time.time() - t0 < 0.5:
+                ce_min = min(ce_raw)
+                ce_max = max(ce_raw)
+                ce_range = ce_max - ce_min if ce_max > ce_min else 1.0
+                for i, (_, fid, *_rest) in enumerate(top20):
+                    quality_by_fid[fid] = float(ce_raw[i] - ce_min) / ce_range
+                reranked_top20 = sorted(
+                    [(quality_by_fid[fid], fid, c, ef, lra, rc)
+                     for _, fid, c, ef, lra, rc in top20],
+                    reverse=True,
+                )
+                scored = reranked_top20 + scored[20:]
+    except Exception:
+        pass
+
+    # ── 9. Apply threshold, token budget, SM-2 EF update ─────────────────
+    ft_by_fid = {r[0]: r[5] for r in rows}
     primary_ids: list[int] = []
     results: list[str] = []
     token_sum = 0
     budget_hit = False
-    for score, fid, content in scored:
+
+    for score, fid, content, ef, lra, rc in scored:
         if score < threshold:
             continue
         if len(results) >= top_n:
             break
-        # Estimate tokens: snippets are denser, others lighter.
-        fact_type_for_budget = next(
-            (ft for f2id, _c, _e, _rc, _ca, ft in rows if f2id == fid), "note"
-        )
-        multiplier = 1.8 if fact_type_for_budget == "snippet" else 1.3
+        multiplier = 1.8 if ft_by_fid.get(fid, "note") == "snippet" else 1.3
         token_est = int(len(content.split()) * multiplier)
         if token_sum + token_est > max_tokens:
             budget_hit = True
@@ -605,20 +739,30 @@ def retrieve_facts(
         token_sum += token_est
         results.append(content)
         primary_ids.append(fid)
+
+        # SM-2 EF update: cross-encoder quality proxy when available, else RRF score.
+        quality = quality_by_fid.get(
+            fid, (raw_rrf.get(fid, 0) / max_rrf) if max_rrf > 0 else 0.5
+        )
+        new_ef = max(1.3, ef + 0.1 - (1.0 - quality) * 0.5)
+        new_ivd = new_ef * (1.0 + (rc + 1) * 0.1)
         conn.execute(
-            "UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE id = ?",
-            (fid,),
+            """UPDATE facts
+               SET retrieval_count = retrieval_count + 1,
+                   last_retrieved_at = ?,
+                   easiness_factor = ?,
+                   interval_days = ?
+               WHERE id = ?""",
+            (now_ts, round(new_ef, 4), round(new_ivd, 4), fid),
         )
 
-    # ── 6. Graph expansion: append connected neighbours not already returned ─
-    # Commit and close BEFORE graph expansion — get_related_facts() opens its own
-    # connection and calls init_db() (DDL). Running DDL while this connection holds
-    # a write lock causes SQLITE_BUSY ("database is locked").
+    # ── 10. Graph expansion ───────────────────────────────────────────────
+    # Commit before opening a second connection in get_related_facts().
     conn.commit()
     conn.close()
 
     seen_content: set[str] = set(results)
-    extra_cap = top_n + 3  # hard cap to prevent context explosion
+    extra_cap = top_n + 3
     for fid in primary_ids:
         if len(results) >= extra_cap:
             break
@@ -638,6 +782,36 @@ def retrieve_facts(
             "total_candidates": total_candidates,
         }
     return results
+
+
+def consolidate_memories(project_id: str, session_id: str) -> dict:
+    """Return the last 50 live facts for LLM-assisted consolidation (Phase 6).
+
+    The caller (LLM) reviews the list for contradictions and redundancies,
+    then calls store_memory to update stale entries.
+    """
+    conn = init_db()
+    cursor = conn.execute(
+        """SELECT id, content, fact_type, created_at, retrieval_count
+           FROM facts
+           WHERE project_id = ?
+             AND superseded_at IS NULL
+             AND (valid_to IS NULL OR valid_to > unixepoch())
+           ORDER BY id DESC LIMIT 50""",
+        (project_id,),
+    )
+    facts = [
+        {
+            "id": r[0],
+            "content": r[1],
+            "fact_type": r[2],
+            "created_at": r[3],
+            "retrieval_count": r[4],
+        }
+        for r in cursor.fetchall()
+    ]
+    conn.close()
+    return {"project_id": project_id, "facts": facts, "count": len(facts)}
 
 
 def get_history(fact_id: int) -> list[dict]:
@@ -817,6 +991,15 @@ if __name__ == "__main__":
         query      = sys.argv[3]
         depth      = int(sys.argv[4]) if len(sys.argv) > 4 else 1
         print(json.dumps(get_graph(project_id, query, depth)))
+
+    elif cmd == "get_history":
+        fact_id = int(sys.argv[2])
+        print(json.dumps(get_history(fact_id)))
+
+    elif cmd == "consolidate_memories":
+        project_id = sys.argv[2]
+        session_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        print(json.dumps(consolidate_memories(project_id, session_id)))
 
     else:
         print(json.dumps({"error": f"Unknown command: {cmd}"}), file=sys.stderr)

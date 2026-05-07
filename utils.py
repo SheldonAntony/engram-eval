@@ -34,3 +34,24 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
+_cross_encoder = None
+_cross_encoder_tried = False
+
+
+def get_cross_encoder():
+    """Lazy-load cross-encoder/ms-marco-MiniLM-L-6-v2 for Phase 4 reranking.
+
+    Returns None silently if sentence-transformers is not installed (~22MB
+    model, CPU-only). Total memory with fastembed: ~112MB.
+    """
+    global _cross_encoder, _cross_encoder_tried
+    if not _cross_encoder_tried:
+        _cross_encoder_tried = True
+        try:
+            from sentence_transformers import CrossEncoder  # lazy import
+            _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        except Exception:
+            pass
+    return _cross_encoder

@@ -13,6 +13,7 @@ Returns:
 """
 
 import json
+import re
 import sys
 
 
@@ -42,6 +43,67 @@ def keyword_extract(text: str) -> list[str]:
     # Trim to a single concise sentence if very long
     sentences = [s.strip() for s in text.replace("\n", ". ").split(".") if s.strip()]
     return [sentences[0][:200]] if sentences else []
+
+
+# ─── Phase 3: spaCy entity + identifier extraction ───────────────────────────
+
+_nlp = None
+_ENTITY_LABELS = {"PERSON", "ORG", "GPE", "PRODUCT", "WORK_OF_ART"}
+# Matches camelCase, PascalCase, snake_case, and ALL_CAPS identifiers
+_IDENTIFIER_RE = re.compile(
+    r'\b([A-Z][a-z]+[A-Z]\w*|[a-z]{2,}_[a-z]\w*|[A-Z]{2,}\w*)\b'
+)
+
+
+def _get_nlp():
+    """Lazy-load spaCy en_core_web_sm. Returns None if not installed."""
+    global _nlp
+    if _nlp is None:
+        try:
+            import spacy  # noqa: PLC0415
+            _nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            _nlp = False  # sentinel: skip retry on subsequent calls
+    return _nlp if _nlp else None
+
+
+def extract_entities(text: str, max_chars: int = 2000) -> list[str]:
+    """Extract named entities and code identifiers from text.
+
+    Uses spaCy labels PERSON/ORG/GPE/PRODUCT/WORK_OF_ART (DATE excluded —
+    relative dates cause false positives across unrelated facts) plus regex
+    for snake_case/camelCase/PascalCase identifiers. Returns deduplicated
+    list of strings with length > 2.
+    """
+    text = text[:max_chars]
+    seen: set[str] = set()
+    results: list[str] = []
+
+    nlp = _get_nlp()
+    if nlp:
+        try:
+            doc = nlp(text)
+            for ent in doc.ents:
+                if ent.label_ in _ENTITY_LABELS:
+                    val = ent.text.strip()
+                    if len(val) > 2 and val not in seen:
+                        seen.add(val)
+                        results.append(val)
+        except Exception:
+            pass
+
+    for m in _IDENTIFIER_RE.finditer(text):
+        val = m.group(1)
+        if len(val) > 2 and val not in seen:
+            seen.add(val)
+            results.append(val)
+
+    return results
+
+
+def _warmup_nlp() -> None:
+    """Pre-load the spaCy model at server startup to avoid first-call latency."""
+    _get_nlp()
 
 
 # ─── LLM council ─────────────────────────────────────────────────────────────

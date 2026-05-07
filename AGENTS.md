@@ -36,3 +36,17 @@ When the user asks WHY something was decided, or HOW a bug was caused,
 or what is RELATED to a topic — call `get_graph` instead of `get_context`.
 It returns connected facts (graph neighbours), not just similar ones.
 This gives richer context for causal or relational questions.
+
+### Memory consolidation
+After approximately 10 exchanges, call `consolidate_memories` with the current
+`project_id` and `session_id`. Review the returned facts list for:
+- Contradictions: newer facts that supersede older ones on the same topic
+- Redundancies: near-duplicate facts that can be merged into one
+- Stale facts: decisions or findings that no longer apply
+
+When you detect a contradiction, note it using this syntax:
+  [CONTRADICTION DETECTED: Fact ID {id} — "{old_snippet}" superseded by "{new_snippet}"]
+Then call `store_memory` with the corrected, consolidated fact.
+
+If `get_context` returns fewer memories than expected (budget_hit is true),
+refine your query to be more specific and call `get_context` again.
