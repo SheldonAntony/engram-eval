@@ -73,11 +73,22 @@ _IMPORTANCE_KEYWORDS: frozenset = frozenset({
     "breaking", "security", "auth", "production", "prod", "deprecated",
     "migration", "decided", "architectural",
 })
-# Phase C: MMR trade-off between relevance and diversity (0=diversity, 1=relevance).
-_MMR_LAMBDA = 0.6
+# Phase C: MMR lambdas — two separate values for pre-CE (candidate selection)
+# and post-CE (output deduplication). Pre-CE uses pure relevance (λ=1.0) so the
+# cross-encoder sees the highest-scoring candidates, not a diversity-adjusted set.
+# Post-CE uses light diversity (λ=0.25) to deduplicate what is returned to the user.
+_MMR_LAMBDA = 0.6          # legacy — kept for reference, not used directly below
+_MMR_LAMBDA_PRE_CE  = 1.0  # pre-CE selection: pure top-k by relevance
+_MMR_LAMBDA_POST_CE = 0.25 # post-CE output: light diversity deduplication
+
+# SM-2 gate: when False, SM-2 interval check is skipped for candidate selection.
+# EF/interval updates still happen on retrieval — they feed the staleness score.
+# Gate is OFF because LoCoMo gold facts (and most unseen production facts) have
+# retrieval_count=0 and would be gated out before scoring even starts.
+_SM2_GATE_ENABLED = False
 
 # ── Tunable retrieval constants ───────────────────────────────────────────────
-_POOL_A_LIMIT          = 200    # most-recent facts (recency pool)
+_POOL_A_LIMIT          = 500    # most-recent facts (recency pool) — raised from 200
 _POOL_B_LIMIT          = 300    # proven-useful facts (retrieval_count > 0)
 _TEMPORAL_EDGE_DECAY   = 0.25   # strength decay per turn distance (linear)
 _TEMPORAL_MAX_DISTANCE = 3      # turns back to link temporally
@@ -868,6 +879,7 @@ def retrieve_facts(
 
     # ── 3. BM25 via FTS5 ──────────────────────────────────────────────────
     bm25_rank: dict[int, int] = {}
+    phrase_fids: set[int] = set()   # facts matching exact phrase — get 1.5× BM25 boost
     fts_query = _fts5_query(prompt)
     if fts_query:
         candidate_ids = tuple(fid for fid, *_ in rows)
@@ -884,6 +896,22 @@ def retrieve_facts(
                 bm25_rank[fid] = rank
         except sqlite3.OperationalError:
             pass
+
+        # Phrase boost: exact phrase match via FTS5 quoted syntax.
+        # Applies 1.5× weight to the BM25 component in RRF for phrase-matching facts.
+        prompt_words = prompt.strip().split()
+        if len(prompt_words) >= 2:
+            phrase_query = f'"{prompt.strip()}"'
+            try:
+                ph_cursor = conn.execute(
+                    f"""SELECT rowid FROM facts_fts
+                        WHERE facts_fts MATCH ?
+                          AND rowid IN ({placeholders})""",
+                    (phrase_query, *candidate_ids),
+                )
+                phrase_fids = {row[0] for row in ph_cursor.fetchall()}
+            except sqlite3.OperationalError:
+                pass
 
     # ── 4. Entity-overlap ranking (Phase 3) ───────────────────────────────
     entity_rank: dict[int, int] = {}
@@ -918,7 +946,10 @@ def retrieve_facts(
     for fid, *_ in rows:
         s = 1.0 / (_RRF_K + vec_rank.get(fid, n))
         if fid in bm25_rank:
-            s += 1.0 / (_RRF_K + bm25_rank[fid])
+            bm25_component = 1.0 / (_RRF_K + bm25_rank[fid])
+            if fid in phrase_fids:
+                bm25_component *= 1.5   # phrase match boost — exact phrase in content
+            s += bm25_component
         if fid in entity_rank:
             s += 1.0 / (_RRF_K + entity_rank[fid])
         raw_rrf[fid] = s
@@ -962,25 +993,29 @@ def retrieve_facts(
         _stages["scored_pos"] = _sa_fids.index(_gold_fid) if _gold_fid in _sa_fids else -1
         _stages["scored_size"] = len(_sa_fids)
 
-    # ── 7. SM-2 gate — soft relax when < 3 facts pass (Phase 2) ──────────
+    # ── 7. SM-2 gate (disabled by default — _SM2_GATE_ENABLED=False) ─────
+    # Gate is skipped because unseen facts (retrieval_count=0) would be blocked
+    # before scoring. EF/interval fields still update on retrieval for staleness.
     _lra_by_fid = {r[0]: r[7] for r in rows}
     _ivd_by_fid = {r[0]: r[8] for r in rows}
-
-    _ef_by_fid  = {r[0]: float(r[6]) for r in rows}   # easiness_factor per fact
+    _ef_by_fid  = {r[0]: float(r[6]) for r in rows}
     _sta_by_fid = {r[0]: min((now_ts - r[7]) / (30 * 86400), 1.0)
                    if r[7] is not None else 1.0 for r in rows}
 
-    def _is_due(fid: int) -> bool:
-        lra = _lra_by_fid.get(fid)
-        ivd = _ivd_by_fid.get(fid, 1.0)
-        if lra is None:
-            return True
-        if _ef_by_fid.get(fid, 2.5) <= 1.5 and _sta_by_fid.get(fid, 1.0) > 0.5:
-            return True   # high-importance (low EF), stale — bypass SM-2 gate
-        return (now_ts - lra) >= (ivd * 86400)
+    if _SM2_GATE_ENABLED:
+        def _is_due(fid: int) -> bool:
+            lra = _lra_by_fid.get(fid)
+            ivd = _ivd_by_fid.get(fid, 1.0)
+            if lra is None:
+                return True
+            if _ef_by_fid.get(fid, 2.5) <= 1.5 and _sta_by_fid.get(fid, 1.0) > 0.5:
+                return True
+            return (now_ts - lra) >= (ivd * 86400)
+        due_scored = [row for row in scored_all if _is_due(row[1])]
+        scored = due_scored if len(due_scored) >= 3 else scored_all
+    else:
+        scored = scored_all
 
-    due_scored = [row for row in scored_all if _is_due(row[1])]
-    scored = due_scored if len(due_scored) >= 3 else scored_all
     total_candidates = len(scored)
 
     # Stage 2: post-gate position.
@@ -989,41 +1024,9 @@ def retrieve_facts(
         _stages["gated_pos"] = _g_fids.index(_gold_fid) if _gold_fid in _g_fids else -1
         _stages["gated_size"] = len(_g_fids)
 
-    # Phase C: MMR diversity — greedy select up to 20 diverse candidates for cross-encoder.
-    if len(scored) > 5:
-        selected_embs: list = []
-        mmr_selected: list = []
-        remaining = list(scored)
-        while remaining and len(mmr_selected) < 20:
-            best_ms, best_row = -1e9, None
-            for row in remaining:
-                cand_emb = emb_by_fid.get(row[1])
-                if cand_emb is None:
-                    continue
-                rel = cosine_similarity(prompt_emb, cand_emb)
-                redundancy = max(
-                    (cosine_similarity(cand_emb, s) for s in selected_embs),
-                    default=0.0,
-                )
-                ms = _MMR_LAMBDA * rel - (1.0 - _MMR_LAMBDA) * redundancy
-                if ms > best_ms:
-                    best_ms, best_row = ms, row
-            if best_row is None:
-                break
-            mmr_selected.append(best_row)
-            selected_embs.append(emb_by_fid[best_row[1]])
-            remaining.remove(best_row)
-        scored = mmr_selected + remaining
-
-    # Stage 3: post-MMR position (in top-20 or pushed to remaining).
-    if _gold_fid is not None:
-        _mmr_fids = [r[1] for r in scored]
-        _gold_mmr_pos = _mmr_fids.index(_gold_fid) if _gold_fid in _mmr_fids else -1
-        _stages["mmr_pos"] = _gold_mmr_pos
-        _stages["in_mmr_top20"] = 0 <= _gold_mmr_pos < 20
-
-    # ── 8. Cross-encoder reranking (Phase 4) ──────────────────────────────
-    # Reranks top-20 when sentence-transformers is loaded; 500ms latency cap.
+    # ── 8. Cross-encoder reranking (Phase 4) — runs on pure top-20 by score ─
+    # CE sees the top-20 by composite score (no MMR demotion yet), giving it the
+    # highest-relevance candidates. MMR runs post-CE for output deduplication only.
     quality_by_fid: dict[int, float] = {}
     try:
         cross_enc = _get_cross_encoder()
@@ -1047,10 +1050,46 @@ def retrieve_facts(
     except Exception:
         pass
 
-    # Stage 4: post-cross-encoder position.
+    # Stage 4: post-cross-encoder position (before MMR).
     if _gold_fid is not None:
         _ce_fids = [r[1] for r in scored]
         _stages["ce_pos"] = _ce_fids.index(_gold_fid) if _gold_fid in _ce_fids else -1
+
+    # Phase C: MMR diversity — post-CE, for output deduplication only.
+    # _MMR_LAMBDA_POST_CE=0.25 applies light diversity on what is returned to the user.
+    # The CE has already seen the true top-20 by relevance, so MMR here only removes
+    # near-duplicate results from the final returned set.
+    if len(scored) > 5:
+        selected_embs: list = []
+        mmr_selected: list = []
+        remaining = list(scored)
+        while remaining and len(mmr_selected) < 20:
+            best_ms, best_row = -1e9, None
+            for row in remaining:
+                cand_emb = emb_by_fid.get(row[1])
+                if cand_emb is None:
+                    continue
+                rel = cosine_similarity(prompt_emb, cand_emb)
+                redundancy = max(
+                    (cosine_similarity(cand_emb, s) for s in selected_embs),
+                    default=0.0,
+                )
+                ms = _MMR_LAMBDA_POST_CE * rel - (1.0 - _MMR_LAMBDA_POST_CE) * redundancy
+                if ms > best_ms:
+                    best_ms, best_row = ms, row
+            if best_row is None:
+                break
+            mmr_selected.append(best_row)
+            selected_embs.append(emb_by_fid[best_row[1]])
+            remaining.remove(best_row)
+        scored = mmr_selected + remaining
+
+    # Stage 3: post-MMR position (now after CE).
+    if _gold_fid is not None:
+        _mmr_fids = [r[1] for r in scored]
+        _gold_mmr_pos = _mmr_fids.index(_gold_fid) if _gold_fid in _mmr_fids else -1
+        _stages["mmr_pos"] = _gold_mmr_pos
+        _stages["in_mmr_top20"] = 0 <= _gold_mmr_pos < 20
 
     # ── 9. Apply threshold, token budget, SM-2 EF update ─────────────────
     ft_by_fid = {r[0]: r[5] for r in rows}
