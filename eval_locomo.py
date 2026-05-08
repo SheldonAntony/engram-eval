@@ -32,7 +32,9 @@ DATA_URL            = "https://raw.githubusercontent.com/snap-research/locomo/ma
 DATA_CACHE          = os.path.join(_PREFLIGHT_DIR, "locomo10.json")
 RESULTS_PATH        = os.path.join(_PREFLIGHT_DIR, "locomo_results.json")
 RECALL_RESULTS_PATH = os.path.join(_PREFLIGHT_DIR, "locomo_recall_results.json")
-_RECALL_KS          = [1, 3, 5, 10]
+_RECALL_KS          = [1, 3, 5, 10, 40]
+_RECALL_TARGET_K    = 40      # which K the target applies to
+_RECALL_TARGET_PCT  = 99.0    # target: R@40 >= 99%
 
 # ── Embedding setup: try real fastembed; fall back to SHA-256 stub ─────────────
 # Must happen BEFORE importing memory so memory.py picks up the right utils.
@@ -253,9 +255,10 @@ def iter_qa(sample: dict):
 # the full project corpus with pure cosine similarity, no row cap.
 
 def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5) -> list[dict]:
-    """Search ALL live facts for project via cosine similarity (no row limit).
+    """Search ALL live facts for project via RRF(cosine + BM25) — no row limit.
 
-    Returns list of dicts with 'id' and 'content' keys, sorted by relevance.
+    Mirrors the run_recall_eval ranker so F1 evaluation uses the same retrieval
+    signal as recall evaluation.  Returns list of dicts with 'id' and 'content'.
     """
     from utils import embed_text as _ue, cosine_similarity as _cs  # noqa: PLC0415
     q_emb = _ue(question)
@@ -264,13 +267,15 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
         """SELECT id, content, embedding FROM facts
            WHERE project_id = ?
              AND superseded_at IS NULL
+             AND fact_type != 'turn'
              AND (valid_to IS NULL OR valid_to > unixepoch())""",
         (project_id,),
     ).fetchall()
-    conn.close()
     if not rows:
+        conn.close()
         return []
-    scored: list[tuple[float, int, str]] = []
+
+    fact_cache: list[tuple[int, str, list]] = []
     for fid, content, blob in rows:
         if blob is None:
             continue
@@ -282,9 +287,48 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
                 emb = json.loads(blob)
             except Exception:
                 continue
-        scored.append((_cs(q_emb, emb), fid, content))
-    scored.sort(reverse=True)
-    return [{"id": fid, "content": c} for _, fid, c in scored[:top_n]]
+        fact_cache.append((fid, content, emb))
+
+    if not fact_cache:
+        conn.close()
+        return []
+
+    # Cosine ranking
+    _RRF_K = 60
+    n_facts = len(fact_cache)
+    cos_ranked = sorted(fact_cache, key=lambda x: _cs(q_emb, x[2]), reverse=True)
+    cos_rank = {fid: i for i, (fid, _, _e) in enumerate(cos_ranked)}
+
+    # BM25 ranking via FTS5
+    bm25_rank: dict[int, int] = {}
+    try:
+        safe   = "".join(c if c.isalnum() or c.isspace() else " " for c in question)
+        tokens = [t for t in safe.split() if len(t) > 2]
+        if tokens:
+            fts_q    = " OR ".join(f'"{t}"' for t in tokens)
+            all_fids = tuple(fid for fid, _, _e in fact_cache)
+            ph       = ",".join("?" for _ in all_fids)
+            bm_rows  = conn.execute(
+                f"SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? AND rowid IN ({ph}) ORDER BY bm25(facts_fts)",
+                (fts_q, *all_fids),
+            ).fetchall()
+            for rank, (bfid,) in enumerate(bm_rows):
+                bm25_rank[bfid] = rank
+    except Exception:
+        pass
+    conn.close()
+
+    # RRF merge
+    rrf: dict[int, float] = {}
+    for fid, _, _e in fact_cache:
+        s = 1.0 / (_RRF_K + cos_rank.get(fid, n_facts))
+        if fid in bm25_rank:
+            s += 1.0 / (_RRF_K + bm25_rank[fid])
+        rrf[fid] = s
+
+    content_by_fid = {fid: content for fid, content, _e in fact_cache}
+    sorted_fids = sorted(rrf, key=rrf.__getitem__, reverse=True)
+    return [{"id": fid, "content": content_by_fid[fid]} for fid in sorted_fids[:top_n]]
 
 
 def build_dia_id_map(samples: list, db_path: str) -> dict:
@@ -548,11 +592,37 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
 
             if has_evidence:
                 q_emb  = _ue(qa["question"])
-                # Rank all facts in memory; slice for each K
-                sorted_ids = [
-                    fid for fid, _ in
-                    sorted(fact_cache, key=lambda x: _cs(q_emb, x[1]), reverse=True)
-                ]
+                # Cosine ranking over preloaded embeddings
+                cos_ranked = sorted(fact_cache, key=lambda x: _cs(q_emb, x[1]), reverse=True)
+                cos_rank = {fid: i for i, (fid, _) in enumerate(cos_ranked)}
+                # BM25 ranking via FTS5 (same DB connection, already open)
+                bm25_rank_eval: dict[int, int] = {}
+                _RRF_K_EVAL = 60
+                try:
+                    safe = "".join(c if c.isalnum() or c.isspace() else " " for c in qa["question"])
+                    tokens = [t for t in safe.split() if len(t) > 2]
+                    if tokens:
+                        fts_q = " OR ".join(f'"{t}"' for t in tokens)
+                        fids_in_cache = tuple(fid for fid, _ in fact_cache)
+                        if fids_in_cache:
+                            ph = ",".join("?" for _ in fids_in_cache)
+                            bm_rows = conn.execute(
+                                f"SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? AND rowid IN ({ph}) ORDER BY bm25(facts_fts)",
+                                (fts_q, *fids_in_cache),
+                            ).fetchall()
+                            for bm_rank, (bfid,) in enumerate(bm_rows):
+                                bm25_rank_eval[bfid] = bm_rank
+                except Exception:
+                    pass
+                # RRF merge: cosine + BM25
+                n_facts = len(fact_cache)
+                rrf_scores: dict[int, float] = {}
+                for fid, _ in fact_cache:
+                    s  = 1.0 / (_RRF_K_EVAL + cos_rank.get(fid, n_facts))
+                    if fid in bm25_rank_eval:
+                        s += 1.0 / (_RRF_K_EVAL + bm25_rank_eval[fid])
+                    rrf_scores[fid] = s
+                sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)
                 hits = {
                     k: bool(set(sorted_ids[:k]) & evidence_fact_ids)
                     for k in _RECALL_KS
@@ -593,6 +663,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
         3:  "did the right turn appear in top 3?",
         5:  "did the right turn appear in top 5?",
         10: "did the right turn appear in top 10?",
+        40: "did the right turn appear in top 40?",
     }
     cat_labels = {
         "single_hop": "Single-hop",
@@ -621,6 +692,9 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
     print(f"  Recall@5 = {r5:.2%} means Preflight found the answer-containing turn")
     print(f"  in the top 5 results for {r5:.0%} of questions.")
     print(f"  This measures pure retrieval quality, independent of answer generation.")
+    _r40_pct = recall_scores.get(_RECALL_TARGET_K, 0.0) * 100
+    _pass = _r40_pct >= _RECALL_TARGET_PCT
+    print(f"\nTarget  R@{_RECALL_TARGET_K} >= {_RECALL_TARGET_PCT:.0f}%  :  {'PASS' if _pass else 'FAIL'}  (got {_r40_pct:.2f}%)")
     print(f"{'='*60}")
 
     result = {
@@ -628,6 +702,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
         "questions_total":         total_qa_all,
         "recall_at_k":             {str(k): round(v * 100, 2) for k, v in recall_scores.items()},
         "recall_at_5_by_category": {c: round(v * 100, 2) for c, v in cat_recall.items()},
+        "target":                  {"k": _RECALL_TARGET_K, "pct": _RECALL_TARGET_PCT, "pass": _pass},
         "per_question":            per_q,
     }
     with open(RECALL_RESULTS_PATH, "w", encoding="utf-8") as f:
