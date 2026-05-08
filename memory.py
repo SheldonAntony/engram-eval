@@ -622,7 +622,12 @@ def store_fact(project_id: str, session_id: str, text: str,
                 best_id = row_id
 
     source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
-    entities = _extract_entities(text)
+    # Skip spaCy NER for window/turn rows — conversational turns contain mostly
+    # speaker names (low discriminability) and the call costs ~0.5s each.
+    # Window rows store blended 3-turn text; entity overlap signal is noisy.
+    # Turn rows are identical speaker:text — entities are subset of window row.
+    # fact_type='note'/'finding'/'decision' etc. still get full entity extraction.
+    entities = [] if fact_type in ("window", "turn") else _extract_entities(text)
     ents_json = json.dumps(entities)
     emb_blob = _encode_embedding(emb)
     # Phase A: importance scoring
