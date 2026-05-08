@@ -306,14 +306,16 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
         tokens = [t for t in safe.split() if len(t) > 2]
         if tokens:
             fts_q    = " OR ".join(f'"{t}"' for t in tokens)
-            all_fids = tuple(fid for fid, _, _e in fact_cache)
-            ph       = ",".join("?" for _ in all_fids)
+            all_fids_set = {fid for fid, _, _e in fact_cache}
             bm_rows  = conn.execute(
-                f"SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? AND rowid IN ({ph}) ORDER BY bm25(facts_fts)",
-                (fts_q, *all_fids),
+                "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? ORDER BY bm25(facts_fts)",
+                (fts_q,),
             ).fetchall()
-            for rank, (bfid,) in enumerate(bm_rows):
-                bm25_rank[bfid] = rank
+            rank = 0
+            for (bfid,) in bm_rows:
+                if bfid in all_fids_set:
+                    bm25_rank[bfid] = rank
+                    rank += 1
     except Exception:
         pass
     conn.close()
@@ -479,6 +481,7 @@ def evaluate(samples: list, mem, db_path: str) -> dict:
             fact_cache_ev.append((fid, content, emb))
 
         all_fids_ev = tuple(fid for fid, _, _e in fact_cache_ev)
+        all_fids_ev_set = set(all_fids_ev)
         n_ev = len(fact_cache_ev)
 
         # Batch-embed all questions for this conversation at once.
@@ -504,13 +507,15 @@ def evaluate(samples: list, mem, db_path: str) -> dict:
                         tokens = [t for t in safe.split() if len(t) > 2]
                         if tokens and all_fids_ev:
                             fts_q = " OR ".join(f'"{t}"' for t in tokens)
-                            ph    = ",".join("?" for _ in all_fids_ev)
                             bm_rows = conn_eval.execute(
-                                f"SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? AND rowid IN ({ph}) ORDER BY bm25(facts_fts)",
-                                (fts_q, *all_fids_ev),
+                                "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? ORDER BY bm25(facts_fts)",
+                                (fts_q,),
                             ).fetchall()
-                            for rank, (bfid,) in enumerate(bm_rows):
-                                bm25_rank_ev[bfid] = rank
+                            rank = 0
+                            for (bfid,) in bm_rows:
+                                if bfid in all_fids_ev_set:
+                                    bm25_rank_ev[bfid] = rank
+                                    rank += 1
                     except Exception:
                         pass
                     # RRF merge
@@ -682,13 +687,16 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                     if tokens:
                         fts_q = " OR ".join(f'"{{t}}"' for t in tokens)
                         if fids_in_cache:
-                            ph = ",".join("?" for _ in fids_in_cache)
+                            fids_set = set(fids_in_cache)
                             bm_rows = conn.execute(
-                                f"SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? AND rowid IN ({ph}) ORDER BY bm25(facts_fts)",
-                                (fts_q, *fids_in_cache),
+                                "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? ORDER BY bm25(facts_fts)",
+                                (fts_q,),
                             ).fetchall()
-                            for bm_rank, (bfid,) in enumerate(bm_rows):
-                                bm25_rank_eval[bfid] = bm_rank
+                            bm_rank = 0
+                            for (bfid,) in bm_rows:
+                                if bfid in fids_set:
+                                    bm25_rank_eval[bfid] = bm_rank
+                                    bm_rank += 1
                 except Exception:
                     pass
                 # RRF merge: cosine + BM25
