@@ -664,6 +664,73 @@ except Exception:
     print("  ERROR:", traceback.format_exc())
 
 
+# -- IMP17-1: consolidate_memories merges two similar facts --
+print("\n-- IMP17-1: consolidate_memories merges similar facts --")
+IMP17_PROJ = "imp17_consolidate_proj"
+try:
+    fid_a = _mem.store_fact(IMP17_PROJ, "imp17_s",
+                             "Alice visited Paris in the summer of 2022", "note", enrich=False)
+    fid_b = _mem.store_fact(IMP17_PROJ, "imp17_s",
+                             "Alice traveled to Paris during summer 2022 for vacation", "note", enrich=False)
+    result17 = _mem.consolidate_memories(IMP17_PROJ, "imp17_s")
+    check("IMP17-1: returns dict with 'merged' key",
+          isinstance(result17, dict) and "merged" in result17,
+          f"got: {result17}")
+    check("IMP17-1: merged >= 1 (similar facts collapsed)",
+          result17.get("merged", 0) >= 1,
+          f"merged={result17.get('merged')}, pairs_checked={result17.get('pairs_checked')}")
+    # After consolidation, the incoming fact should be superseded.
+    _c17 = sqlite3.connect(_DB)
+    _live17 = _c17.execute(
+        "SELECT COUNT(*) FROM facts WHERE project_id = ? AND superseded_at IS NULL",
+        (IMP17_PROJ,),
+    ).fetchone()[0]
+    _c17.close()
+    check("IMP17-1: only 1 live fact remains after merge",
+          _live17 == 1, f"live facts={_live17}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# -- IMP17-2: consolidate_memories with single fact returns merged=0 --
+print("\n-- IMP17-2: consolidate_memories with 1 fact returns merged=0 --")
+IMP17B_PROJ = "imp17b_single_proj"
+try:
+    # Only 1 fact → no pair to compare → merged must be 0.
+    _mem.store_fact(IMP17B_PROJ, "imp17b_s",
+                    "the server uses nginx as a reverse proxy", "note", enrich=False)
+    result17b = _mem.consolidate_memories(IMP17B_PROJ, "imp17b_s")
+    check("IMP17-2: no merge with only 1 fact",
+          result17b.get("merged", 99) == 0,
+          f"merged={result17b.get('merged')}, pairs_checked={result17b.get('pairs_checked')}")
+    _c17b = sqlite3.connect(_DB)
+    _live17b = _c17b.execute(
+        "SELECT COUNT(*) FROM facts WHERE project_id = ? AND superseded_at IS NULL",
+        (IMP17B_PROJ,),
+    ).fetchone()[0]
+    _c17b.close()
+    check("IMP17-2: the single fact is still live", _live17b == 1, f"live facts={_live17b}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# -- IMP17-3: consolidate_memories respects max_merges cap --
+print("\n-- IMP17-3: consolidate_memories respects max_merges cap --")
+IMP17C_PROJ = "imp17c_cap_proj"
+try:
+    # Store 6 nearly-identical facts.
+    for _k in range(6):
+        _mem.store_fact(IMP17C_PROJ, "imp17c_s",
+                        f"Alice went to Paris in summer 2022 variant {_k}", "note", enrich=False)
+    result17c = _mem.consolidate_memories(IMP17C_PROJ, "imp17c_s", max_merges=2)
+    check("IMP17-3: merged <= 2 (cap respected)",
+          result17c.get("merged", 99) <= 2,
+          f"merged={result17c.get('merged')}")
+    check("IMP17-3: max_merges echoed in result",
+          result17c.get("max_merges") == 2,
+          f"max_merges={result17c.get('max_merges')}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+
 # -- IMP16-1: store_turn_window stores fact_type='window' by default --
 print("\n-- IMP16-1: store_turn_window uses fact_type='window' by default --")
 IMP16_PROJ = "imp16_window_type_proj"
