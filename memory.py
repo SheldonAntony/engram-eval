@@ -587,24 +587,28 @@ def store_fact(project_id: str, session_id: str, text: str,
         _compacted_this_process = True
 
     # Find the most-similar live fact in this project (last 200).
-    cursor = conn.execute(
-        """SELECT id, embedding FROM facts
-           WHERE project_id = ?
-             AND superseded_at IS NULL
-             AND (valid_to IS NULL OR valid_to > unixepoch())
-           ORDER BY id DESC LIMIT 200""",
-        (project_id,),
-    )
+    # Window facts are intentionally overlapping (sharing 2 of 3 turns) so
+    # their cosine similarity is always high — skip the scan to prevent them
+    # from chain-superseding each other and destroying historical context.
     best_id: int | None = None
     best_sim: float = 0.0
-    for row_id, emb_data in cursor.fetchall():
-        existing_emb = _decode_embedding(emb_data)
-        if existing_emb is None:
-            continue
-        sim = cosine_similarity(emb, existing_emb)
-        if sim > best_sim:
-            best_sim = sim
-            best_id = row_id
+    if fact_type != "window":
+        cursor = conn.execute(
+            """SELECT id, embedding FROM facts
+               WHERE project_id = ?
+                 AND superseded_at IS NULL
+                 AND (valid_to IS NULL OR valid_to > unixepoch())
+               ORDER BY id DESC LIMIT 200""",
+            (project_id,),
+        )
+        for row_id, emb_data in cursor.fetchall():
+            existing_emb = _decode_embedding(emb_data)
+            if existing_emb is None:
+                continue
+            sim = cosine_similarity(emb, existing_emb)
+            if sim > best_sim:
+                best_sim = sim
+                best_id = row_id
 
     source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
     entities = _extract_entities(text)
