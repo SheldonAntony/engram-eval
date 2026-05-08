@@ -553,6 +553,12 @@ def store_fact(project_id: str, session_id: str, text: str,
                     existing_ents = set()
                 if not (existing_ents & set(entities)):
                     continue
+                # Require >=2 shared entities OR ratio >0.3 to avoid false merges
+                # on single generic entities (e.g. "Python", "API").
+                _shared_e = existing_ents & set(entities)
+                _ratio_e  = len(_shared_e) / max(len(existing_ents), len(entities), 1)
+                if len(_shared_e) < 2 and _ratio_e <= 0.3:
+                    continue
                 # Semantic similarity check: only enrich when facts are related.
                 existing_emb_row = conn.execute(
                     "SELECT embedding FROM facts WHERE id = ?", (efid,)
@@ -796,7 +802,7 @@ def retrieve_facts(
     pool_a_ids = {r[0] for r in pool_a}
     pool_b_raw = conn.execute(
         f"SELECT {_COLS} FROM facts WHERE {_WHERE} AND retrieval_count > 0 "
-        f"ORDER BY last_retrieved_at DESC, retrieval_count DESC LIMIT ?",
+        f"ORDER BY retrieval_count DESC, last_retrieved_at DESC LIMIT ?",
         (project_id, _POOL_A_LIMIT + _POOL_B_LIMIT),
     ).fetchall()
     pool_b = [r for r in pool_b_raw if r[0] not in pool_a_ids][:_POOL_B_LIMIT]
@@ -882,7 +888,15 @@ def retrieve_facts(
                     fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
                 except Exception:
                     fact_ents = set()
-                overlap = len(prompt_ents & fact_ents) / max(len(prompt_ents), len(fact_ents), 1)
+                shared = prompt_ents & fact_ents
+                n_shared = len(shared)
+                ratio = n_shared / max(len(prompt_ents), len(fact_ents), 1)
+                # Require >=2 shared entities OR ratio >0.3 to prevent
+                # single generic-entity false matches (e.g. "Python", "the project").
+                if n_shared >= 2 or ratio > 0.3:
+                    overlap = ratio
+                else:
+                    overlap = 0.0
                 ent_scores.append((overlap, fid))
             ent_scores.sort(reverse=True)
             entity_rank = {fid: rank for rank, (_, fid) in enumerate(ent_scores)}
@@ -938,11 +952,17 @@ def retrieve_facts(
     _lra_by_fid = {r[0]: r[7] for r in rows}
     _ivd_by_fid = {r[0]: r[8] for r in rows}
 
+    _ef_by_fid  = {r[0]: float(r[6]) for r in rows}   # easiness_factor per fact
+    _sta_by_fid = {r[0]: min((now_ts - r[7]) / (30 * 86400), 1.0)
+                   if r[7] is not None else 1.0 for r in rows}
+
     def _is_due(fid: int) -> bool:
         lra = _lra_by_fid.get(fid)
         ivd = _ivd_by_fid.get(fid, 1.0)
         if lra is None:
             return True
+        if _ef_by_fid.get(fid, 2.5) <= 1.5 and _sta_by_fid.get(fid, 1.0) > 0.5:
+            return True   # high-importance (low EF), stale — bypass SM-2 gate
         return (now_ts - lra) >= (ivd * 86400)
 
     due_scored = [row for row in scored_all if _is_due(row[1])]
