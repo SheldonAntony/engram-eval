@@ -461,7 +461,7 @@ _TURNS = [
 try:
     _mem.store_turn_window(IMP2_PROJ, "imp2_s", _TURNS, 2)
     _c21 = sqlite3.connect(_DB)
-    _row21 = _c21.execute("SELECT content FROM facts WHERE project_id = ? ORDER BY id DESC LIMIT 1",
+    _row21 = _c21.execute("SELECT content FROM facts WHERE project_id = ? AND fact_type = 'window' ORDER BY id DESC LIMIT 1",
                           (IMP2_PROJ,)).fetchone()
     _c21.close()
     _content21 = _row21[0] if _row21 else ""
