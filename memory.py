@@ -76,6 +76,16 @@ _IMPORTANCE_KEYWORDS: frozenset = frozenset({
 # Phase C: MMR trade-off between relevance and diversity (0=diversity, 1=relevance).
 _MMR_LAMBDA = 0.6
 
+# ── Tunable retrieval constants ───────────────────────────────────────────────
+_POOL_A_LIMIT          = 200    # most-recent facts (recency pool)
+_POOL_B_LIMIT          = 300    # proven-useful facts (retrieval_count > 0)
+_TEMPORAL_EDGE_DECAY   = 0.25   # strength decay per turn distance (linear)
+_TEMPORAL_MAX_DISTANCE = 3      # turns back to link temporally
+_SESSION_RECENCY_DECAY = 0.15   # score decay per session gap
+_SESSION_MAX_LOOKBACK  = 7      # sessions back before score → 0.0
+_ENRICHMENT_MAX_TOKENS = 500    # max combined tokens before enrichment falls back to insert
+_ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact before enriching
+
 
 # ─── Database init ────────────────────────────────────────────────────────────
 
@@ -167,6 +177,26 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "importance",        "REAL",      "0.5")
     _ensure_column(conn, "slot_fills", "project_id",        "TEXT",      "'unknown'")
     _ensure_column(conn, "slot_fills", "created_at",        "TIMESTAMP", "CURRENT_TIMESTAMP")
+    _ensure_column(conn, "sessions",   "session_index",     "INTEGER",   "0")
+
+    # One-time backfill: assign sequential session_index per project ordered by enriched_at.
+    try:
+        projects = conn.execute(
+            "SELECT DISTINCT project_id FROM sessions WHERE session_index = 0"
+        ).fetchall()
+        for (pid,) in projects:
+            sids = conn.execute(
+                "SELECT session_id FROM sessions WHERE project_id = ? "
+                "AND session_index = 0 ORDER BY enriched_at",
+                (pid,),
+            ).fetchall()
+            for idx, (sid,) in enumerate(sids, start=1):
+                conn.execute(
+                    "UPDATE sessions SET session_index = ? WHERE session_id = ?",
+                    (idx, sid),
+                )
+    except Exception:
+        pass
 
     # Unique constraint so store_slot_fill can upsert instead of always inserting.
     # Must deduplicate first — old insert-always behaviour may have left multiple
@@ -424,7 +454,7 @@ def _get_cross_encoder():
 
 
 def store_fact(project_id: str, session_id: str, text: str,
-               fact_type: str = "note") -> None:
+               fact_type: str = "note", enrich: bool = True) -> "int | None":
     """Store a fact with soft-expire on contradiction, binary embedding, entity extraction.
 
     Contradiction detection: cosine similarity >= _CONTRADICTION_THRESHOLD writes a
@@ -503,24 +533,103 @@ def store_fact(project_id: str, session_id: str, text: str,
             (saved_id, text),
         )
     else:
-        cur = conn.execute(
-            """INSERT INTO facts
-               (project_id, session_id, content, embedding, fact_type,
-                source_session, source_hash, entities, importance, easiness_factor)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (project_id, session_id, text, emb_blob, fact_type,
-             session_id, source_hash, ents_json, round(importance, 4), round(init_ef, 4)),
-        )
-        saved_id = cur.lastrowid
-        conn.execute(
-            "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
-            (saved_id, text),
-        )
-        conn.execute(
-            """INSERT INTO fact_mutations (fact_id, mutation_type, new_content, session_id)
-               VALUES (?, 'INSERT', ?, ?)""",
-            (saved_id, text, session_id),
-        )
+        # ── Entity enrichment: merge into a recent same-session fact that shares entities ──
+        # Avoids storing a disconnected row when the new text is a continuation
+        # of an existing same-session fact about the same real-world entity.
+        # Skipped when enrich=False (e.g. store_turn_window) or entities are empty.
+        enrich_id: "int | None" = None
+        if enrich and entities:
+            recent_rows = conn.execute(
+                """SELECT id, entities FROM facts
+                   WHERE project_id = ? AND session_id = ?
+                     AND superseded_at IS NULL
+                   ORDER BY id DESC LIMIT 10""",
+                (project_id, session_id),
+            ).fetchall()
+            for efid, e_ents_json in recent_rows:
+                try:
+                    existing_ents = set(json.loads(e_ents_json or "[]"))
+                except Exception:
+                    existing_ents = set()
+                if not (existing_ents & set(entities)):
+                    continue
+                # Semantic similarity check: only enrich when facts are related.
+                existing_emb_row = conn.execute(
+                    "SELECT embedding FROM facts WHERE id = ?", (efid,)
+                ).fetchone()
+                existing_emb = _decode_embedding(existing_emb_row[0]) if existing_emb_row else None
+                if existing_emb is None or cosine_similarity(emb, existing_emb) < _ENRICH_MIN_SIM:
+                    continue
+                existing_row = conn.execute(
+                    "SELECT content FROM facts WHERE id = ?", (efid,)
+                ).fetchone()
+                existing_content = existing_row[0] if existing_row else ""
+                if len((existing_content + "\n" + text).split()) <= _ENRICHMENT_MAX_TOKENS:
+                    enrich_id = efid
+                    break
+
+        if enrich_id is not None:
+            old_row = conn.execute(
+                "SELECT content, entities FROM facts WHERE id = ?", (enrich_id,)
+            ).fetchone()
+            old_content   = old_row[0] if old_row else ""
+            old_ents_json = old_row[1] if old_row else "[]"
+            enriched_content = old_content + "\n" + text
+            try:
+                merged_ents = list(set(json.loads(old_ents_json or "[]")) | set(entities))
+            except Exception:
+                merged_ents = entities
+            enriched_emb  = embed_text(enriched_content)
+            enriched_blob = _encode_embedding(enriched_emb)
+            e_words   = enriched_content.split()
+            e_density = min(len(merged_ents) / max(len(e_words), 1) * 5, 1.0)
+            e_kw      = 0.2 if any(kw in enriched_content.lower() for kw in _IMPORTANCE_KEYWORDS) else 0.0
+            e_importance = min(1.0, type_weight * 0.5 + e_density * 0.3 + e_kw * 0.2)
+            e_ef         = max(1.3, 3.0 - e_importance)
+            # FTS5 external-content: remove old entry before updating facts row.
+            conn.execute(
+                "INSERT INTO facts_fts(facts_fts, rowid, content) VALUES('delete', ?, ?)",
+                (enrich_id, old_content),
+            )
+            conn.execute(
+                """UPDATE facts
+                   SET content = ?, embedding = ?, entities = ?,
+                       importance = ?, easiness_factor = ?,
+                       last_retrieved_at = ?
+                   WHERE id = ?""",
+                (enriched_content, enriched_blob, json.dumps(merged_ents),
+                 round(e_importance, 4), round(e_ef, 4), time.time(), enrich_id),
+            )
+            conn.execute(
+                "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
+                (enrich_id, enriched_content),
+            )
+            conn.execute(
+                """INSERT INTO fact_mutations
+                   (fact_id, mutation_type, old_content, new_content, session_id)
+                   VALUES (?, 'ENRICH', ?, ?, ?)""",
+                (enrich_id, old_content, enriched_content, session_id),
+            )
+            saved_id = enrich_id
+        else:
+            cur = conn.execute(
+                """INSERT INTO facts
+                   (project_id, session_id, content, embedding, fact_type,
+                    source_session, source_hash, entities, importance, easiness_factor)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (project_id, session_id, text, emb_blob, fact_type,
+                 session_id, source_hash, ents_json, round(importance, 4), round(init_ef, 4)),
+            )
+            saved_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
+                (saved_id, text),
+            )
+            conn.execute(
+                """INSERT INTO fact_mutations (fact_id, mutation_type, new_content, session_id)
+                   VALUES (?, 'INSERT', ?, ?)""",
+                (saved_id, text, session_id),
+            )
 
     # ── Auto-link: graph edges to semantically related existing facts ─────
     link_cursor = conn.execute(
@@ -546,8 +655,32 @@ def store_fact(project_id: str, session_id: str, text: str,
                 (id_a, id_b, relation, round(sim, 4)),
             )
 
+    # ── Temporal proximity linking ─────────────────────────────────────────
+    # Link to the last _TEMPORAL_MAX_DISTANCE facts in the same session.
+    # Bridges conversationally adjacent facts that may be semantically unrelated.
+    temporal_neighbors = conn.execute(
+        """SELECT id FROM facts
+           WHERE project_id = ? AND session_id = ? AND id != ?
+             AND superseded_at IS NULL
+           ORDER BY id DESC LIMIT ?""",
+        (project_id, session_id, saved_id, _TEMPORAL_MAX_DISTANCE),
+    ).fetchall()
+    for distance, (neighbor_id,) in enumerate(temporal_neighbors, start=1):
+        t_strength = round(max(0.0, 1.0 - (distance - 1) * _TEMPORAL_EDGE_DECAY), 4)
+        t_id_a, t_id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
+        conn.execute(
+            """INSERT INTO fact_relations (fact_id_a, fact_id_b, relation, strength)
+               VALUES (?, ?, 'temporal', ?)
+               ON CONFLICT(fact_id_a, fact_id_b) DO UPDATE SET
+                   strength = excluded.strength,
+                   relation = 'temporal'
+               WHERE excluded.strength > strength""",
+            (t_id_a, t_id_b, t_strength),
+        )
+
     conn.commit()
     conn.close()
+    return saved_id
 
 
 def _fts5_query(prompt: str) -> str:
@@ -562,6 +695,61 @@ def _fts5_query(prompt: str) -> str:
         return ""
     # Quote each token to avoid FTS5 keyword collisions (AND/OR/NOT/NEAR).
     return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def _session_recency_score(
+    fact_session_id: "str | None",
+    current_session_id: str,
+    session_idx_map: dict,
+) -> float:
+    """Return a session proximity score in [0.0, 1.0].
+
+    1.0 when the fact comes from the current session; decays by
+    _SESSION_RECENCY_DECAY per session gap; 0.0 at _SESSION_MAX_LOOKBACK or beyond.
+    Returns 0.5 (neutral) when either session is unknown so facts stored
+    before session_index tracking was added are not penalised.
+    """
+    if fact_session_id == current_session_id:
+        return 1.0
+    if not fact_session_id:
+        return 0.5
+    fact_idx = session_idx_map.get(fact_session_id)
+    curr_idx = session_idx_map.get(current_session_id)
+    if fact_idx is None or curr_idx is None:
+        return 0.5
+    gap = abs(curr_idx - fact_idx)
+    if gap >= _SESSION_MAX_LOOKBACK:
+        return 0.0
+    return max(0.0, 1.0 - gap * _SESSION_RECENCY_DECAY)
+
+
+def store_turn_window(
+    project_id: str,
+    session_id: str,
+    turns: list,
+    current_index: int,
+    fact_type: str = "note",
+) -> "int | None":
+    """Store a 3-turn sliding window centred on current_index as a single fact.
+
+    Tags: [prev] for preceding turn, [curr] for current, [next] for following.
+    Each turn dict must have 'speaker' and 'text' keys.
+
+    Designed for batch ingestion of conversational data (e.g. LoCoMo eval).
+    For real-time coding sessions, use store_fact() directly.
+
+    Semantic duplication across overlapping windows is intentional — different
+    neighbouring context yields different embeddings and different retrieval matches.
+
+    Returns the fact_id of the stored or enriched fact.
+    """
+    window: list[str] = []
+    for i in range(max(0, current_index - 1), min(len(turns), current_index + 2)):
+        turn = turns[i]
+        tag = "[curr]" if i == current_index else ("[prev]" if i < current_index else "[next]")
+        window.append(f"{tag} {turn['speaker']}: {turn['text']}")
+    content = "\n".join(window)
+    return store_fact(project_id, session_id, content, fact_type, enrich=False)
 
 
 def retrieve_facts(
@@ -587,20 +775,35 @@ def retrieve_facts(
     now_ts = time.time()
     conn = init_db()
 
-    # ── 1. Pull candidate pool (last 200 live facts) ───────────────────────
-    cursor = conn.execute(
-        """SELECT id, content, embedding, retrieval_count, created_at, fact_type,
-                  easiness_factor, last_retrieved_at, interval_days, entities,
-                  COALESCE(importance, 0.5)
-           FROM facts
-           WHERE project_id = ?
-             AND superseded_at IS NULL
-             AND (valid_to IS NULL OR valid_to > unixepoch())
-           ORDER BY id DESC LIMIT 200""",
-        (project_id,),
+    # ── 1. Pull candidate pool: Pool A (recency) + Pool B (proven useful) ─
+    # Pool A: _POOL_A_LIMIT most-recent facts by insert time.
+    # Pool B: proven-useful facts (retrieval_count > 0), capped at _POOL_B_LIMIT,
+    #         ordered by recency-of-use then total use count.
+    # Separate caps prevent Pool B's proven hits from drowning Pool A's recency.
+    _COLS = (
+        "id, content, embedding, retrieval_count, created_at, fact_type, "
+        "easiness_factor, last_retrieved_at, interval_days, entities, "
+        "COALESCE(importance, 0.5), session_id"
     )
+    _WHERE = (
+        "project_id = ? AND superseded_at IS NULL "
+        "AND (valid_to IS NULL OR valid_to > unixepoch())"
+    )
+    pool_a = conn.execute(
+        f"SELECT {_COLS} FROM facts WHERE {_WHERE} ORDER BY id DESC LIMIT ?",
+        (project_id, _POOL_A_LIMIT),
+    ).fetchall()
+    pool_a_ids = {r[0] for r in pool_a}
+    pool_b_raw = conn.execute(
+        f"SELECT {_COLS} FROM facts WHERE {_WHERE} AND retrieval_count > 0 "
+        f"ORDER BY last_retrieved_at DESC, retrieval_count DESC LIMIT ?",
+        (project_id, _POOL_A_LIMIT + _POOL_B_LIMIT),
+    ).fetchall()
+    pool_b = [r for r in pool_b_raw if r[0] not in pool_a_ids][:_POOL_B_LIMIT]
+    all_candidate_rows = pool_a + pool_b
+
     rows: list = []
-    for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents, imp in cursor.fetchall():
+    for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents, imp, fsid in all_candidate_rows:
         emb = _decode_embedding(emb_data)
         if emb is None:
             continue
@@ -612,6 +815,7 @@ def retrieve_facts(
             ivd if ivd is not None else 1.0,
             ents,
             imp if imp is not None else 0.5,
+            fsid,
         ))
 
     if not rows:
@@ -673,7 +877,7 @@ def retrieve_facts(
         prompt_ents = set(e.lower() for e in _extract_entities(prompt))
         if prompt_ents:
             ent_scores = []
-            for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp in rows:
+            for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp, _fsid in rows:
                 try:
                     fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
                 except Exception:
@@ -699,9 +903,20 @@ def retrieve_facts(
     max_rrf = max(raw_rrf.values()) if raw_rrf else 1.0
 
     # ── 6. Combined score per fact ─────────────────────────────────────────
+    # Preload session indices for session_recency scoring (one DB read, not per-fact).
+    session_idx_map: dict[str, int] = {}
+    try:
+        for _sid, _sidx in conn.execute(
+            "SELECT session_id, session_index FROM sessions WHERE project_id = ?",
+            (project_id,),
+        ).fetchall():
+            session_idx_map[_sid] = _sidx
+    except Exception:
+        pass
+
     now = datetime.now(timezone.utc)
     scored_all: list = []
-    for fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents, imp in rows:
+    for fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents, _imp, fsid in rows:
         rrf = (raw_rrf[fid] / max_rrf) if max_rrf > 0 else 0.0
         try:
             ca_dt = _parse_dt(ca)
@@ -712,7 +927,9 @@ def retrieve_facts(
         recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
         freq = (rc / max_rc) if max_rc > 0 else 0.0
         staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
-        score = 0.35 * rrf + 0.20 * recency + 0.15 * freq + 0.20 * staleness + 0.10 * imp
+        session_rec = _session_recency_score(fsid, session_id, session_idx_map)
+        # Weights sum to 1.0. importance dropped — encoded in easiness_factor at insert time.
+        score = 0.35 * rrf + 0.20 * recency + 0.20 * staleness + 0.15 * session_rec + 0.10 * freq
         # (score, fid, content, ef, lra, rc)
         scored_all.append((score, fid, content, ef, lra, rc))
     scored_all.sort(reverse=True, key=lambda x: x[0])
@@ -958,12 +1175,21 @@ def session_seen(session_id: str) -> bool:
 
 
 def session_mark(session_id: str, project_id: str) -> None:
-    """Record that this session has been enriched."""
+    """Record that this session has been enriched, assigning a sequential session_index."""
     conn = init_db()
-    conn.execute(
-        "INSERT OR IGNORE INTO sessions (session_id, project_id) VALUES (?, ?)",
-        (session_id, project_id),
-    )
+    existing = conn.execute(
+        "SELECT session_index FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    if existing is None:
+        max_idx = conn.execute(
+            "SELECT COALESCE(MAX(session_index), 0) FROM sessions WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, project_id, session_index) "
+            "VALUES (?, ?, ?)",
+            (session_id, project_id, max_idx + 1),
+        )
     conn.commit()
     conn.close()
 
@@ -1001,6 +1227,14 @@ if __name__ == "__main__":
         project_id, session_id, text = sys.argv[2], sys.argv[3], sys.argv[4]
         fact_type = sys.argv[5] if len(sys.argv) > 5 else "note"
         store_fact(project_id, session_id, text, fact_type)
+
+    elif cmd == "store_turn_window":
+        project_id    = sys.argv[2]
+        session_id    = sys.argv[3]
+        turns         = json.loads(sys.argv[4])
+        current_index = int(sys.argv[5])
+        fact_type     = sys.argv[6] if len(sys.argv) > 6 else "note"
+        print(store_turn_window(project_id, session_id, turns, current_index, fact_type))
 
     elif cmd == "retrieve_facts":
         project_id, session_id, prompt = sys.argv[2], sys.argv[3], sys.argv[4]
