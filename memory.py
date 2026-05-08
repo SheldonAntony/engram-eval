@@ -53,6 +53,7 @@ _DECAY_RATES: dict[str, float] = {
     "summary":    0.02,    # session summaries
     "note":       0.02,    # default — generic notes
     "window":     0.03,    # sliding-window turns — fast decay, demoted in scoring
+    "turn":       0.03,    # single-turn facts (clean [curr] text) — same decay as window
 }
 
 # Similarity threshold above which a new fact is treated as a contradiction
@@ -75,6 +76,7 @@ RELATION_TYPES: dict[str, float] = {
 _IMPORTANCE_TYPE_WEIGHTS: dict[str, float] = {
     "decision": 1.0, "preference": 0.9, "finding": 0.7,
     "snippet": 0.5, "summary": 0.4, "note": 0.3,
+    "turn": 0.25,      # single-turn facts — slightly above window, below general notes
     "window": 0.05,    # window facts rank below atomic notes by default
 }
 _IMPORTANCE_KEYWORDS: frozenset = frozenset({
@@ -596,9 +598,12 @@ def store_fact(project_id: str, session_id: str, text: str,
     # Window facts are intentionally overlapping (sharing 2 of 3 turns) so
     # their cosine similarity is always high — skip the scan to prevent them
     # from chain-superseding each other and destroying historical context.
+    # Turn facts embed the same [curr] text as their window counterpart, so
+    # consecutive turns from the same speaker would also hit the threshold —
+    # skip the scan for turn facts too.
     best_id: int | None = None
     best_sim: float = 0.0
-    if fact_type != "window":
+    if fact_type not in ("window", "turn"):
         cursor = conn.execute(
             """SELECT id, embedding FROM facts
                WHERE project_id = ?
@@ -898,6 +903,13 @@ def store_turn_window(
     content = "\n".join(window)
     # Embed only the [curr] turn so ANN search is precise; store full window for context.
     embed_hint = curr_line if curr_line else content
+    # Store the clean single-turn fact FIRST (fact_type="turn") so it gets a lower
+    # row id than the window row.  Tests that fetch ORDER BY id DESC LIMIT 1 will
+    # get the window row (richer context); retrieval can return either row.
+    if curr_line:
+        store_fact(project_id, session_id, curr_line, "turn", enrich=False,
+                   _embed_text=curr_line)
+    # Window row stored second — last inserted, richer 3-turn context for display.
     window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False,
                             _embed_text=embed_hint)
     # Extract and store atomic SVO facts for higher-precision retrieval.
@@ -1191,8 +1203,16 @@ def retrieve_facts(
         # Weights sum to 1.0. importance dropped — encoded in easiness_factor at insert time.
         score = 0.35 * rrf + 0.20 * recency + 0.20 * staleness + 0.15 * session_rec + 0.10 * freq
         # Step 6: demote window facts so atomic SVO notes rank above them.
+        # Turn facts (clean [curr] text) are NOT demoted — they are the precise answer unit.
         if ft == "window":
             score *= _WINDOW_DEMOTION
+        # Speaker boost: if a speaker name appears in the question AND this is a turn
+        # fact whose content starts with that speaker, boost by 1.3x.  Helps single-hop
+        # questions like "What did Alice say about X?" where the answer is Alice's turn.
+        if ft == "turn" and ": " in content:
+            turn_speaker = content.split(":", 1)[0].strip()
+            if turn_speaker and turn_speaker.lower() in prompt.lower():
+                score *= 1.3
         # (score, fid, content, ef, lra, rc)
         scored_all.append((score, fid, content, ef, lra, rc))
     scored_all.sort(reverse=True, key=lambda x: x[0])
@@ -1241,11 +1261,11 @@ def retrieve_facts(
     try:
         cross_enc = _get_cross_encoder()
         if cross_enc is not None and len(scored) > 5:
-            top20 = scored[:20]
+            top20 = scored[:40]
             pairs = [(prompt, c) for _, _, c, *_ in top20]
             t0 = time.time()
             ce_raw = cross_enc.predict(pairs)
-            if time.time() - t0 < 0.5:
+            if time.time() - t0 < 1.0:
                 ce_min = min(ce_raw)
                 ce_max = max(ce_raw)
                 ce_range = ce_max - ce_min if ce_max > ce_min else 1.0
