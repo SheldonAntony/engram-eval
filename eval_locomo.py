@@ -441,18 +441,88 @@ def ingest(samples: list, mem, mode: str) -> dict:
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 def evaluate(samples: list, mem, db_path: str) -> dict:
+    """Run F1 evaluation. Preloads embeddings per project (one DB read per conv)."""
+    from utils import embed_texts_batch as _ub, cosine_similarity as _cs  # noqa: PLC0415
     per_q:       list[dict]         = []
     cat_scores:  dict[str, list]    = {}
     n_retrieved  = 0
     n_budget     = 0
+    _RRF_K = 60
+
+    conn_eval = sqlite3.connect(db_path)
 
     for sample in samples:
         sid_str = str(sample.get("sample_id", 0))
         pid     = f"locomo_{sid_str}"
-        for qa in iter_qa(sample):
+
+        # Preload all fact embeddings + content for this project (one DB read).
+        rows_ev = conn_eval.execute(
+            """SELECT id, content, embedding FROM facts
+               WHERE project_id = ?
+                 AND superseded_at IS NULL
+                 AND fact_type != 'turn'
+                 AND (valid_to IS NULL OR valid_to > unixepoch())""",
+            (pid,),
+        ).fetchall()
+        fact_cache_ev: list[tuple[int, str, list]] = []
+        for fid, content, blob in rows_ev:
+            if blob is None:
+                continue
+            if isinstance(blob, (bytes, bytearray)):
+                n   = len(blob) // 4
+                emb = list(struct.unpack(f"{n}f", blob))
+            else:
+                try:
+                    emb = json.loads(blob)
+                except Exception:
+                    continue
+            fact_cache_ev.append((fid, content, emb))
+
+        all_fids_ev = tuple(fid for fid, _, _e in fact_cache_ev)
+        n_ev = len(fact_cache_ev)
+
+        # Batch-embed all questions for this conversation at once.
+        qa_list_ev = list(iter_qa(sample))
+        if fact_cache_ev and qa_list_ev:
+            q_embs_ev = _ub([qa["question"] for qa in qa_list_ev])
+        else:
+            q_embs_ev = [None] * len(qa_list_ev)
+
+        for qa, q_emb_ev in zip(qa_list_ev, q_embs_ev):
             try:
-                # Use full-corpus retrieval (no 200-row cap) for benchmark accuracy.
-                facts = _eval_retrieve(db_path, pid, qa["question"], top_n=5)
+                if not fact_cache_ev or q_emb_ev is None:
+                    facts = []
+                else:
+                    q_emb = q_emb_ev
+                    # Cosine ranking
+                    cos_ranked = sorted(fact_cache_ev, key=lambda x: _cs(q_emb, x[2]), reverse=True)
+                    cos_rank = {fid: i for i, (fid, _, _e) in enumerate(cos_ranked)}
+                    # BM25 via FTS5
+                    bm25_rank_ev: dict[int, int] = {}
+                    try:
+                        safe   = "".join(c if c.isalnum() or c.isspace() else " " for c in qa["question"])
+                        tokens = [t for t in safe.split() if len(t) > 2]
+                        if tokens and all_fids_ev:
+                            fts_q = " OR ".join(f'"{t}"' for t in tokens)
+                            ph    = ",".join("?" for _ in all_fids_ev)
+                            bm_rows = conn_eval.execute(
+                                f"SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? AND rowid IN ({ph}) ORDER BY bm25(facts_fts)",
+                                (fts_q, *all_fids_ev),
+                            ).fetchall()
+                            for rank, (bfid,) in enumerate(bm_rows):
+                                bm25_rank_ev[bfid] = rank
+                    except Exception:
+                        pass
+                    # RRF merge
+                    rrf: dict[int, float] = {}
+                    for fid, _, _e in fact_cache_ev:
+                        s = 1.0 / (_RRF_K + cos_rank.get(fid, n_ev))
+                        if fid in bm25_rank_ev:
+                            s += 1.0 / (_RRF_K + bm25_rank_ev[fid])
+                        rrf[fid] = s
+                    content_by_fid = {fid: content for fid, content, _e in fact_cache_ev}
+                    sorted_fids    = sorted(rrf, key=rrf.__getitem__, reverse=True)
+                    facts = [{"id": fid, "content": content_by_fid[fid]} for fid in sorted_fids[:5]]
                 budget_hit = False
             except Exception:
                 facts, budget_hit = [], False
@@ -471,6 +541,7 @@ def evaluate(samples: list, mem, db_path: str) -> dict:
                 "facts_retrieved": len(facts),
             })
 
+    conn_eval.close()
     total   = len(per_q)
     overall = sum(q["f1"] for q in per_q) / max(total, 1)
     by_cat  = {c: round(sum(s) / len(s) * 100, 2) for c, s in cat_scores.items()}
@@ -527,7 +598,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
     in-memory cosine ranking for all 1540 questions — much faster than one
     DB round-trip per question.
     """
-    from utils import embed_text as _ue, cosine_similarity as _cs  # noqa: PLC0415
+    from utils import embed_text as _ue, embed_texts_batch as _ub, cosine_similarity as _cs  # noqa: PLC0415
 
     print(f"\n{'='*60}")
     print(f"  RECALL@K EVALUATION  (Mode B corpus)")
@@ -581,7 +652,15 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                     continue
             fact_cache.append((fid, emb))
 
-        for qa in iter_qa(sample):
+        # Batch-embed all questions for this conversation at once.
+        # fastembed processes the full list in one ONNX forward pass —
+        # ~10-100x faster than calling embed_text() in a per-question loop.
+        qa_list = list(iter_qa(sample))
+        q_texts = [qa["question"] for qa in qa_list]
+        q_embs  = _ub(q_texts)
+        fids_in_cache = tuple(fid for fid, _ in fact_cache)
+
+        for qa, q_emb in zip(qa_list, q_embs):
             evidence         = qa["evidence"]
             evidence_fact_ids: set = set()
             for d in evidence:
@@ -591,8 +670,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
             has_evidence     = bool(evidence) and bool(evidence_fact_ids)
 
             if has_evidence:
-                q_emb  = _ue(qa["question"])
-                # Cosine ranking over preloaded embeddings
+                # Cosine ranking over preloaded embeddings (q_emb from batch)
                 cos_ranked = sorted(fact_cache, key=lambda x: _cs(q_emb, x[1]), reverse=True)
                 cos_rank = {fid: i for i, (fid, _) in enumerate(cos_ranked)}
                 # BM25 ranking via FTS5 (same DB connection, already open)
@@ -602,8 +680,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                     safe = "".join(c if c.isalnum() or c.isspace() else " " for c in qa["question"])
                     tokens = [t for t in safe.split() if len(t) > 2]
                     if tokens:
-                        fts_q = " OR ".join(f'"{t}"' for t in tokens)
-                        fids_in_cache = tuple(fid for fid, _ in fact_cache)
+                        fts_q = " OR ".join(f'"{{t}}"' for t in tokens)
                         if fids_in_cache:
                             ph = ",".join("?" for _ in fids_in_cache)
                             bm_rows = conn.execute(
