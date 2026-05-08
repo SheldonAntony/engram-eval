@@ -1095,6 +1095,38 @@ def consolidate_memories(project_id: str, session_id: str) -> dict:
     return {"project_id": project_id, "facts": facts, "count": len(facts)}
 
 
+def memory_release(fact_id: int, session_id: str = "") -> dict:
+    """Soft-delete a fact by marking it superseded, writing a RELEASE mutation.
+
+    RELEASE = fact is correct but no longer contextually relevant to the
+    current task.  Distinct from SUPERSEDE (fact was wrong/contradicted).
+    The fact remains in history; superseded_at makes it invisible to retrieval.
+    Returns {"ok": True, "fact_id": fact_id} or {"ok": False, "error": "..."}.
+    """
+    conn = init_db()
+    row = conn.execute(
+        "SELECT id, content, superseded_at FROM facts WHERE id = ?", (fact_id,)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return {"ok": False, "error": f"fact_id {fact_id} not found"}
+    if row[2] is not None:
+        conn.close()
+        return {"ok": False, "error": f"fact_id {fact_id} already superseded"}
+    old_content = row[1]
+    conn.execute(
+        "UPDATE facts SET superseded_at = unixepoch() WHERE id = ?", (fact_id,)
+    )
+    conn.execute(
+        """INSERT INTO fact_mutations (fact_id, mutation_type, old_content, session_id)
+           VALUES (?, 'RELEASE', ?, ?)""",
+        (fact_id, old_content, session_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "fact_id": fact_id}
+
+
 def get_history(fact_id: int) -> list[dict]:
     """Return the mutation log for a fact (INSERT, SUPERSEDE, etc.)."""
     conn = init_db()
@@ -1298,6 +1330,11 @@ if __name__ == "__main__":
         project_id = sys.argv[2]
         session_id = sys.argv[3] if len(sys.argv) > 3 else ""
         print(json.dumps(consolidate_memories(project_id, session_id)))
+
+    elif cmd == "memory_release":
+        fact_id    = int(sys.argv[2])
+        session_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        print(json.dumps(memory_release(fact_id, session_id)))
 
     else:
         print(json.dumps({"error": f"Unknown command: {cmd}"}), file=sys.stderr)
