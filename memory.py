@@ -568,7 +568,8 @@ def _get_cross_encoder():
 
 
 def store_fact(project_id: str, session_id: str, text: str,
-               fact_type: str = "note", enrich: bool = True) -> "int | None":
+               fact_type: str = "note", enrich: bool = True,
+               _embed_text: "str | None" = None) -> "int | None":
     """Store a fact with soft-expire on contradiction, binary embedding, entity extraction.
 
     Contradiction detection: cosine similarity >= _CONTRADICTION_THRESHOLD writes a
@@ -576,9 +577,14 @@ def store_fact(project_id: str, session_id: str, text: str,
     Phase 3: extracted entities stored as JSON list for entity-overlap retrieval.
     Phase 7: embeddings stored as compact binary blobs (struct.pack, 4 bytes/float).
     Phase 7.5: old INSERT mutations (> 90 days) compacted once per process.
+
+    _embed_text: when provided, the embedding is computed from this string instead of
+    `text`.  The DB content column still stores `text`.  Use this in store_turn_window
+    to embed only the [curr] turn so ANN search is precise, while storing the full
+    3-turn window for context display.
     """
     global _compacted_this_process
-    emb = embed_text(text)
+    emb = embed_text(_embed_text if _embed_text is not None else text)
     conn = init_db()
 
     # Phase 7.5: compact old INSERT mutations once per process lifetime.
@@ -856,6 +862,7 @@ def store_turn_window(
     turns: list,
     current_index: int,
     fact_type: str = "window",
+    extract_svo: bool = True,
 ) -> "int | None":
     """Store a 3-turn sliding window centred on current_index as a single fact.
 
@@ -868,24 +875,37 @@ def store_turn_window(
     Semantic duplication across overlapping windows is intentional — different
     neighbouring context yields different embeddings and different retrieval matches.
 
-    Step 6: also extracts spaCy SVO atomic facts from each turn in the window
-    and stores them as separate note-type facts for higher-precision retrieval.
-    Windows themselves are tagged fact_type='window' and demoted in scoring.
+    The embedding is computed from the [curr] turn text only (not the full
+    3-turn window) so that ANN search matches the question against the specific
+    turn that contains the answer, not a blended 3-turn vector.  The full window
+    is still stored as content for context display.
+
+    extract_svo: when False, skip spaCy SVO extraction.  Pass False during
+    bulk benchmark ingestion — conversational text yields <1% SVO triples but
+    the spaCy calls dominate ingestion time (~0.5s each × 5882 turns = 3200s).
 
     Returns the fact_id of the stored or enriched fact.
     """
     window: list[str] = []
+    curr_line: str = ""
     for i in range(max(0, current_index - 1), min(len(turns), current_index + 2)):
         turn = turns[i]
         tag = "[curr]" if i == current_index else ("[prev]" if i < current_index else "[next]")
-        window.append(f"{tag} {turn['speaker']}: {turn['text']}")
+        line = f"{tag} {turn['speaker']}: {turn['text']}"
+        window.append(line)
+        if i == current_index:
+            curr_line = f"{turn['speaker']}: {turn['text']}"
     content = "\n".join(window)
-    # Store the window fact (demoted in retrieval scoring).
-    window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False)
+    # Embed only the [curr] turn so ANN search is precise; store full window for context.
+    embed_hint = curr_line if curr_line else content
+    window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False,
+                            _embed_text=embed_hint)
     # Extract and store atomic SVO facts for higher-precision retrieval.
-    svo_facts = _extract_svo_facts(content)
-    for svo in svo_facts:
-        store_fact(project_id, session_id, svo, "note", enrich=True)
+    # Skip during bulk ingestion (extract_svo=False) — spaCy is ~0.5s/window.
+    if extract_svo:
+        svo_facts = _extract_svo_facts(content)
+        for svo in svo_facts:
+            store_fact(project_id, session_id, svo, "note", enrich=True)
     return window_fid
 
 
