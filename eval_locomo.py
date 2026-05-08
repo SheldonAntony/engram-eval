@@ -347,7 +347,11 @@ def recall_at_k(
     if not evidence_dia_ids:
         return None
     pid_map = dia_id_map.get(project_id, {})
-    evidence_fact_ids = {pid_map[d] for d in evidence_dia_ids if d in pid_map}
+    evidence_fact_ids: set = set()
+    for d in evidence_dia_ids:
+        fids = pid_map.get(d)
+        if fids:
+            evidence_fact_ids.update(fids)
     if not evidence_fact_ids:
         return None
     facts = _eval_retrieve(db_path, project_id, question, top_n=k)
@@ -485,7 +489,8 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
     t0 = time.time()
     dia_id_map  = build_dia_id_map(samples, db_path)
     n_mapped    = sum(len(v) for v in dia_id_map.values())
-    print(f"  Done in {time.time() - t0:.1f}s \u2014 {n_mapped} turns mapped to fact IDs")
+    n_fids_total = sum(len(fids) for pid_m in dia_id_map.values() for fids in pid_m.values())
+    print(f"  Done in {time.time() - t0:.1f}s \u2014 {n_mapped} turns mapped ({n_fids_total} total fact IDs)")
 
     print("\nScoring Recall@K...", flush=True)
     per_q: list[dict] = []
@@ -522,7 +527,11 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
 
         for qa in iter_qa(sample):
             evidence         = qa["evidence"]
-            evidence_fact_ids = {pid_map[d] for d in evidence if d in pid_map}
+            evidence_fact_ids: set = set()
+            for d in evidence:
+                fids = pid_map.get(d)
+                if fids:
+                    evidence_fact_ids.update(fids)
             has_evidence     = bool(evidence) and bool(evidence_fact_ids)
 
             if has_evidence:
