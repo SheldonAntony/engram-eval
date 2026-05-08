@@ -26,6 +26,26 @@ def embed_text(text: str) -> list[float]:
     return vec
 
 
+def embed_texts_batch(texts: list) -> list:
+    """Generate normalized embedding vectors for a list of texts in one batch.
+
+    Uses fastembed's native batch inference — significantly faster than calling
+    embed_text() in a loop because the ONNX model processes the full batch at
+    once.  Returns a list of float lists, one per input text, in input order.
+    """
+    if not texts:
+        return []
+    model = get_embedding_model()
+    result = []
+    for vec in model.embed(texts):
+        vec = [float(x) for x in vec]
+        norm = sum(x ** 2 for x in vec) ** 0.5
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        result.append(vec)
+    return result
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two pre-normalized vectors."""
     dot = sum(x * y for x, y in zip(a, b))
@@ -41,17 +61,17 @@ _cross_encoder_tried = False
 
 
 def get_cross_encoder():
-    """Lazy-load cross-encoder/ms-marco-MiniLM-L-6-v2 for Phase 4 reranking.
+    """Lazy-load mixedbread-ai/mxbai-rerank-xsmall-v1 for Phase 4 reranking.
 
-    Returns None silently if sentence-transformers is not installed (~22MB
-    model, CPU-only). Total memory with fastembed: ~112MB.
+    Returns None silently if sentence-transformers is not installed (~142MB
+    model, CPU-only). Total memory with fastembed: ~252MB.
     """
     global _cross_encoder, _cross_encoder_tried
     if not _cross_encoder_tried:
         _cross_encoder_tried = True
         try:
             from sentence_transformers import CrossEncoder  # lazy import
-            _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            _cross_encoder = CrossEncoder("mixedbread-ai/mxbai-rerank-xsmall-v1")
         except Exception:
             pass
     return _cross_encoder
