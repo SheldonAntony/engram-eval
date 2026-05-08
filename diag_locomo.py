@@ -126,9 +126,6 @@ def main():
             has_gold += 1
             gold_fid = gold_fids[0]   # use first evidence turn
 
-            # Override DB path so _mem uses our eval DB
-            _mem._DB_PATH = str(DB_B)   # type: ignore[attr-defined]
-
             try:
                 result = _mem.retrieve_facts(
                     pid, f"{pid}_diag", question,
@@ -252,12 +249,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # Monkey-patch _mem to use eval DB instead of production DB.
+    # Override DB_PATH so init_db() opens the eval DB instead of production.
     import memory as _mem_mod
-    _orig_init_db = _mem_mod.init_db
-    def _patched_init_db():
-        conn = sqlite3.connect(str(DB_B))
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
-    _mem_mod.init_db = _patched_init_db
+    _mem_mod.DB_PATH = str(DB_B)
     main()
