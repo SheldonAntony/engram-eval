@@ -207,6 +207,13 @@ def _extract_svo_facts(window_content: str) -> list[str]:
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    # WAL mode: readers don't block writers; writers don't block readers.
+    # synchronous=NORMAL: fsync only on WAL checkpoint, not every commit.
+    # Together these cut per-commit latency by ~10-100x on bulk ingestion
+    # (11764 commits for LoCoMo eval vs default DELETE+FULL which fsyncs each).
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -32768")   # 32 MB page cache
 
     # Feature 2: project_id column on all tables
     conn.execute("""
