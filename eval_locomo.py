@@ -374,7 +374,8 @@ def ingest(samples: list, mem, mode: str) -> dict:
             for turn_idx, turn_dict in enumerate(session_turns):
                 total_turns += 1
                 if mode == "B":
-                    mem.store_turn_window(pid, sid, session_turns, turn_idx)
+                    mem.store_turn_window(pid, sid, session_turns, turn_idx,
+                                         extract_svo=False)
                 try:
                     for fact in _ext.keyword_extract(turn_dict["text"]):
                         mem.store_fact(pid, sid, fact, "finding")
