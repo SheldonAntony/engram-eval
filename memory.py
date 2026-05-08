@@ -33,7 +33,7 @@ except ImportError:
     _NUMPY_AVAILABLE = False
 
 # Feature 1 Bug 3: shared utilities extracted from this module
-from utils import cosine_similarity, embed_text
+from utils import cosine_similarity, embed_text, embed_texts_batch
 
 try:
     from extractor import extract_entities as _extract_entities
@@ -930,20 +930,27 @@ def store_turn_window(
         if i == current_index:
             curr_line = f"{turn['speaker']}: {turn['text']}"
     content = "\n".join(window)
-    # Embed only the [curr] turn so ANN search is precise; store full window for context.
-    embed_hint = curr_line if curr_line else content
-    # Compute the [curr]-turn embedding ONCE and share it between the turn row and
-    # window row — both use the same vector, so one model inference call suffices.
-    shared_emb = embed_text(embed_hint)
+    # Embed the FULL [prev][curr][next] window for window facts — the [prev] turn
+    # is often the conversational question that [curr] answers, so embedding the
+    # full window captures Q&A semantics that match retrieval queries far better
+    # than [curr]-only embedding.  Turn facts keep curr-only for precise matching.
+    # Use batch inference: one ONNX forward pass for both embeddings.
+    if curr_line and curr_line != content:
+        batch_embs = embed_texts_batch([curr_line, content])
+        turn_emb   = batch_embs[0]
+        window_emb = batch_embs[1]
+    else:
+        window_emb = embed_text(content)
+        turn_emb   = window_emb
     # Store the clean single-turn fact FIRST (fact_type="turn") so it gets a lower
     # row id than the window row.  Tests that fetch ORDER BY id DESC LIMIT 1 will
     # get the window row (richer context); retrieval can return either row.
     if curr_line:
         store_fact(project_id, session_id, curr_line, "turn", enrich=False,
-                   _precomputed_emb=shared_emb)
+                   _precomputed_emb=turn_emb)
     # Window row stored second — last inserted, richer 3-turn context for display.
     window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False,
-                            _precomputed_emb=shared_emb)
+                            _precomputed_emb=window_emb)
     # Extract and store atomic SVO facts for higher-precision retrieval.
     # Skip during bulk ingestion (extract_svo=False) — spaCy is ~0.5s/window.
     if extract_svo:
