@@ -25,6 +25,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
+
 # Feature 1 Bug 3: shared utilities extracted from this module
 from utils import cosine_similarity, embed_text
 
@@ -96,6 +102,14 @@ _SESSION_RECENCY_DECAY = 0.15   # score decay per session gap
 _SESSION_MAX_LOOKBACK  = 7      # sessions back before score → 0.0
 _ENRICHMENT_MAX_TOKENS = 500    # max combined tokens before enrichment falls back to insert
 _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact before enriching
+
+
+# ── Embedding cache for ANN-based Pool A ─────────────────────────────────────
+# Keyed by project_id → (fid_list, emb_matrix) where emb_matrix is shape (N, D).
+# Populated lazily on first retrieve call for a project.
+# _cache_dirty tracks which projects need a reload after a write.
+_EMB_CACHE: "dict[str, tuple[list[int], object]]" = {}
+_CACHE_DIRTY: "set[str]" = set()
 
 
 # ─── Database init ────────────────────────────────────────────────────────────
@@ -697,6 +711,9 @@ def store_fact(project_id: str, session_id: str, text: str,
 
     conn.commit()
     conn.close()
+    # Invalidate the ANN embedding cache for this project so the next
+    # retrieve_facts() call reloads fresh embeddings including this new fact.
+    _CACHE_DIRTY.add(project_id)
     return saved_id
 
 
@@ -793,11 +810,11 @@ def retrieve_facts(
     now_ts = time.time()
     conn = init_db()
 
-    # ── 1. Pull candidate pool: Pool A (recency) + Pool B (proven useful) ─
-    # Pool A: _POOL_A_LIMIT most-recent facts by insert time.
-    # Pool B: proven-useful facts (retrieval_count > 0), capped at _POOL_B_LIMIT,
-    #         ordered by recency-of-use then total use count.
-    # Separate caps prevent Pool B's proven hits from drowning Pool A's recency.
+    # ── 1. Pull candidate pool: Pool A (ANN cosine) + Pool B (proven useful) ─
+    # Pool A: top-_POOL_A_LIMIT by cosine similarity to query — query-anchored, not
+    #         time-anchored. Falls back to recency order if numpy unavailable.
+    # Pool B: proven-useful facts (retrieval_count > 0), capped at _POOL_B_LIMIT.
+    # Separate caps prevent Pool B from drowning Pool A's relevance results.
     _COLS = (
         "id, content, embedding, retrieval_count, created_at, fact_type, "
         "easiness_factor, last_retrieved_at, interval_days, entities, "
@@ -807,10 +824,70 @@ def retrieve_facts(
         "project_id = ? AND superseded_at IS NULL "
         "AND (valid_to IS NULL OR valid_to > unixepoch())"
     )
-    pool_a = conn.execute(
-        f"SELECT {_COLS} FROM facts WHERE {_WHERE} ORDER BY id DESC LIMIT ?",
-        (project_id, _POOL_A_LIMIT),
-    ).fetchall()
+
+    # ── Pool A: ANN via in-process embedding cache ────────────────────────
+    # Cache stores (fid_list, emb_matrix) per project. Rebuilt when dirty.
+    pool_a: list = []
+    if _NUMPY_AVAILABLE:
+        if project_id in _CACHE_DIRTY or project_id not in _EMB_CACHE:
+            # Load all live fact IDs + embeddings for this project.
+            cache_rows = conn.execute(
+                "SELECT id, embedding FROM facts WHERE project_id = ? "
+                "AND superseded_at IS NULL "
+                "AND (valid_to IS NULL OR valid_to > unixepoch())",
+                (project_id,),
+            ).fetchall()
+            cache_fids: list[int] = []
+            cache_vecs: list = []
+            for cfid, cemb_blob in cache_rows:
+                vec = _decode_embedding(cemb_blob)
+                if vec is not None:
+                    cache_fids.append(cfid)
+                    cache_vecs.append(vec)
+            if cache_vecs:
+                mat = np.array(cache_vecs, dtype=np.float32)
+                # Normalise rows so dot product == cosine similarity.
+                norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                norms = np.where(norms == 0, 1.0, norms)
+                mat = mat / norms
+                _EMB_CACHE[project_id] = (cache_fids, mat)
+            else:
+                _EMB_CACHE[project_id] = ([], None)
+            _CACHE_DIRTY.discard(project_id)
+
+        cached_fids, cached_mat = _EMB_CACHE.get(project_id, ([], None))
+        if cached_mat is not None and len(cached_fids) > 0:
+            # Embed the bare prompt for ANN pool selection.
+            # (augmented_prompt is built later after pool; vector ranking step uses it.)
+            prompt_emb_raw = embed_text(prompt)
+            qvec = np.array(prompt_emb_raw, dtype=np.float32)
+            qnorm = np.linalg.norm(qvec)
+            if qnorm > 0:
+                qvec = qvec / qnorm
+            sims = cached_mat @ qvec          # shape (N,), cosine similarity
+            top_k = min(_POOL_A_LIMIT, len(cached_fids))
+            top_indices = np.argpartition(sims, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+            top_fids = [cached_fids[i] for i in top_indices]
+            if top_fids:
+                placeholders = ",".join("?" for _ in top_fids)
+                pool_a = conn.execute(
+                    f"SELECT {_COLS} FROM facts WHERE id IN ({placeholders}) "
+                    f"AND superseded_at IS NULL",
+                    top_fids,
+                ).fetchall()
+                # Re-sort to match cosine similarity order.
+                fid_order = {fid: rank for rank, fid in enumerate(top_fids)}
+                pool_a = sorted(pool_a, key=lambda r: fid_order.get(r[0], 9999))
+
+    if not pool_a:
+        # Fallback: recency order (original behaviour), used when numpy unavailable
+        # or cache is empty (no facts stored yet).
+        pool_a = conn.execute(
+            f"SELECT {_COLS} FROM facts WHERE {_WHERE} ORDER BY id DESC LIMIT ?",
+            (project_id, _POOL_A_LIMIT),
+        ).fetchall()
+
     pool_a_ids = {r[0] for r in pool_a}
     pool_b_raw = conn.execute(
         f"SELECT {_COLS} FROM facts WHERE {_WHERE} AND retrieval_count > 0 "
