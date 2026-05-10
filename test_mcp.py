@@ -797,6 +797,299 @@ except Exception:
     print("  ERROR:", traceback.format_exc())
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Tests 17 — context_broker: save_turn / resolve_missing_context / submit
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 17: context_broker — save_turn ──")
+
+_broker = None
+try:
+    # Load the broker via mcp_server's lazy loader, then redirect its DB.
+    _broker = srv._get_broker()
+    _broker.DB_PATH = _DB
+    check("T17-0: broker loaded without error", _broker is not None)
+except Exception:
+    print("  ERROR loading broker:", traceback.format_exc())
+
+CB_PROJ = "cb_test_proj"
+CB_SESS = "cb_sess_1"
+
+if _broker:
+    try:
+        tid = _broker.save_turn(CB_PROJ, CB_SESS, "user",
+                                "compare that run with baseline", embed=False)
+        check("T17-1: save_turn returns positive int turn_id",
+              isinstance(tid, int) and tid > 0, f"got: {tid!r}")
+        conn_cb = sqlite3.connect(_DB)
+        row = conn_cb.execute(
+            "SELECT role, content FROM conversation_turns WHERE id = ?", (tid,)
+        ).fetchone()
+        conn_cb.close()
+        check("T17-2: row exists in conversation_turns", row is not None)
+        if row:
+            check("T17-3: role stored correctly", row[0] == "user", f"got: {row[0]!r}")
+            check("T17-4: content stored correctly", "compare" in row[1], f"got: {row[1]!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+    try:
+        res = srv.tool_save_turn(CB_PROJ, CB_SESS, "assistant",
+                                 "The accepted config was RRF_K=20.")
+        check("T17-5: tool_save_turn returns saved=True", res.get("saved") is True, f"got: {res}")
+        check("T17-6: turn_id is positive int",
+              isinstance(res.get("turn_id"), int) and res["turn_id"] > 0, f"got: {res}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 18 — context_broker: update_active_task / get_active_task
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 18: context_broker — active task state ──")
+if _broker:
+    try:
+        _broker.update_active_task(
+            CB_PROJ, CB_SESS,
+            active_topic="locomo benchmark",
+            active_task="improve R@40",
+            current_phase="ablation",
+            open_threads=["try CE reranker", "check entity overlap"],
+            recent_decisions=["RRF_K=20 is best", "BM25_WEIGHT=1.0"],
+            active_runs=["locomo_eval_B.db"],
+        )
+        state = _broker.get_active_task(CB_PROJ, CB_SESS)
+        check("T18-1: active_topic stored",
+              state.get("active_topic") == "locomo benchmark",
+              f"got: {state.get('active_topic')!r}")
+        check("T18-2: open_threads is a list",
+              isinstance(state.get("open_threads"), list),
+              f"got: {state.get('open_threads')!r}")
+        check("T18-3: recent_decisions correct length",
+              len(state.get("recent_decisions", [])) == 2,
+              f"got: {state.get('recent_decisions')!r}")
+        check("T18-4: active_runs stored",
+              "locomo_eval_B.db" in state.get("active_runs", []),
+              f"got: {state.get('active_runs')!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 19 — context_broker: set_slot / get_slot
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 19: context_broker — set_slot / get_slot ──")
+if _broker:
+    try:
+        _broker.set_slot(CB_PROJ, CB_SESS, "rrf_k", "20",
+                         scope="project", confidence=0.95, confirmed_by_user=True)
+        slot = _broker.get_slot(CB_PROJ, CB_SESS, "rrf_k")
+        check("T19-1: slot value is '20'",
+              slot is not None and slot.get("value") == "20", f"got: {slot}")
+        check("T19-2: confirmed_by_user is True",
+              slot is not None and slot.get("confirmed_by_user") is True,
+              f"got: {slot}")
+        check("T19-3: confidence >= 0.9",
+              slot is not None and slot.get("confidence", 0) >= 0.9, f"got: {slot}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 20 — resolve_missing_context fills from active task state
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 20: resolve_missing_context — fills from active task state ──")
+if _broker:
+    try:
+        result = _broker.resolve_missing_context(
+            missing=["what is the active_topic?", "active_task"],
+            project_id=CB_PROJ,
+            session_id=CB_SESS,
+            user_message="continue where we left off",
+        )
+        check("T20-1: result is a dict", isinstance(result, dict))
+        check("T20-2: status is resolved or partial",
+              result.get("status") in ("resolved", "partial"),
+              f"got: {result.get('status')!r}")
+        filled = result.get("filled", {})
+        check("T20-3: active_topic is in filled slots",
+              "active_topic" in filled, f"filled keys: {list(filled.keys())}")
+        if "active_topic" in filled:
+            check("T20-4: active_topic value is 'locomo benchmark'",
+                  filled["active_topic"].get("value") == "locomo benchmark",
+                  f"got: {filled['active_topic'].get('value')!r}")
+            check("T20-5: source is 'active_task_state'",
+                  filled["active_topic"].get("source") == "active_task_state",
+                  f"got: {filled['active_topic'].get('source')!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 21 — resolve_missing_context returns needs_user for cold-start
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 21: resolve_missing_context — needs_user on cold start ──")
+if _broker:
+    COLD_PROJ = "cb_cold_proj_x"
+    COLD_SESS = "cb_cold_sess_x"
+    try:
+        result = _broker.resolve_missing_context(
+            missing=["active_topic", "what does 'it' refer to?"],
+            project_id=COLD_PROJ,
+            session_id=COLD_SESS,
+            user_message="continue it from before",
+        )
+        check("T21-1: result is a dict", isinstance(result, dict))
+        check("T21-2: status is needs_user (no prior state)",
+              result.get("status") == "needs_user",
+              f"got: {result.get('status')!r}")
+        questions = result.get("needs_user_questions", [])
+        check("T21-3: at least one clarification question generated",
+              len(questions) > 0, f"got: {questions}")
+        if questions:
+            q = questions[0]
+            check("T21-4: question has 'slot' field", "slot" in q,
+                  f"got keys: {list(q.keys())}")
+            check("T21-5: question has 'options' (never open-ended)",
+                  "options" in q and isinstance(q["options"], list),
+                  f"got: {q.get('options')!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 22 — submit_clarification_answer saves slot + updates task state
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 22: submit_clarification_answer ──")
+if _broker:
+    CLAR_PROJ = "cb_clar_proj"
+    CLAR_SESS = "cb_clar_sess"
+    try:
+        res = _broker.submit_clarification_answer(
+            slot_name="active_topic",
+            value="locomo retrieval benchmark",
+            project_id=CLAR_PROJ,
+            session_id=CLAR_SESS,
+        )
+        check("T22-1: saved=True returned", res.get("saved") is True, f"got: {res}")
+        slot = _broker.get_slot(CLAR_PROJ, CLAR_SESS, "active_topic")
+        check("T22-2: slot saved in context_slots", slot is not None)
+        if slot:
+            check("T22-3: confirmed_by_user is True",
+                  slot.get("confirmed_by_user") is True, f"got: {slot}")
+            check("T22-4: confidence = 1.0",
+                  slot.get("confidence") == 1.0, f"got: {slot.get('confidence')!r}")
+        state = _broker.get_active_task(CLAR_PROJ, CLAR_SESS)
+        check("T22-5: active_topic updated in task state",
+              state.get("active_topic") == "locomo retrieval benchmark",
+              f"got: {state.get('active_topic')!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+    # Via mcp_server tool
+    try:
+        res22b = srv.tool_submit_clarification(
+            slot_name="active_task",
+            value="improve R@40 to 99%",
+            project_id=CB_PROJ,
+            session_id=CB_SESS,
+        )
+        check("T22-6: tool_submit_clarification saved=True",
+              res22b.get("saved") is True, f"got: {res22b}")
+        check("T22-7: task_state returned",
+              isinstance(res22b.get("task_state"), dict),
+              f"got: {res22b.get('task_state')!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 23 — upsert_topic / get_recent_topics
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 23: upsert_topic / get_recent_topics ──")
+if _broker:
+    TOPIC_PROJ = "cb_topic_proj"
+    try:
+        _broker.upsert_topic(
+            TOPIC_PROJ, "locomo benchmark",
+            status_summary="RRF_K=20 best, R@40=93.08%",
+            session_id="sess_locomo_1",
+            files=["locomo_eval_A.db"],
+        )
+        _broker.upsert_topic(
+            TOPIC_PROJ, "cross-encoder reranker",
+            status_summary="not yet enabled",
+            session_id="sess_locomo_2",
+        )
+        topics = _broker.get_recent_topics(TOPIC_PROJ, limit=5)
+        check("T23-1: two topics returned", len(topics) == 2, f"got: {len(topics)}")
+        labels = [t["topic"] for t in topics]
+        check("T23-2: 'locomo benchmark' in topics",
+              "locomo benchmark" in labels, f"got: {labels}")
+        check("T23-3: status_summary stored",
+              any("93.08" in (t.get("status_summary") or "") for t in topics),
+              f"got: {[t.get('status_summary') for t in topics]}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 24 — detect_task_frame + TOOL_USE_INSTRUCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 24: detect_task_frame + TOOL_USE_INSTRUCTIONS ──")
+if _broker:
+    try:
+        frame = _broker.detect_task_frame("there's a crash in the retrieval module", [])
+        check("T24-1: debug_error frame detected",
+              frame == "debug_error", f"got: {frame!r}")
+        frame2 = _broker.detect_task_frame("compare the two runs", [])
+        check("T24-2: compare_experiments frame detected",
+              frame2 == "compare_experiments", f"got: {frame2!r}")
+        frame3 = _broker.detect_task_frame("where are we on the benchmark?", [])
+        check("T24-3: summarize_status or run_benchmark detected",
+              frame3 in ("summarize_status", "run_benchmark"), f"got: {frame3!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+try:
+    check("T24-4: TOOL_USE_INSTRUCTIONS is a non-empty string",
+          isinstance(srv.TOOL_USE_INSTRUCTIONS, str) and len(srv.TOOL_USE_INSTRUCTIONS) > 100,
+          f"got len={len(getattr(srv, 'TOOL_USE_INSTRUCTIONS', ''))}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 25 — resolve_missing_context: conversation history evidence
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Test 25: resolve_missing_context — conversation history evidence ──")
+if _broker:
+    HIST_PROJ = "cb_hist_proj"
+    HIST_SESS = "cb_hist_sess"
+    try:
+        for i in range(25):
+            _broker.save_turn(HIST_PROJ, HIST_SESS,
+                              "user" if i % 2 == 0 else "assistant",
+                              f"Turn {i}: generic message about codebase",
+                              embed=False)
+        _broker.save_turn(HIST_PROJ, HIST_SESS, "user",
+                          "we accepted RRF_K=20 and BM25_WEIGHT=1.0 as the production config",
+                          embed=False)
+        for i in range(5):
+            _broker.save_turn(HIST_PROJ, HIST_SESS, "user",
+                              f"Follow-up turn {i}", embed=False)
+
+        result = _broker.resolve_missing_context(
+            missing=["what config was accepted for production?"],
+            project_id=HIST_PROJ,
+            session_id=HIST_SESS,
+            user_message="use the accepted production config for this run",
+            context_window_size=10,
+        )
+        check("T25-1: resolve returns a dict", isinstance(result, dict))
+        check("T25-2: evidence list returned",
+              isinstance(result.get("evidence"), list), f"got: {result.get('evidence')!r}")
+        check("T25-3: status is one of resolved/partial/needs_user",
+              result.get("status") in ("resolved", "partial", "needs_user"),
+              f"got: {result.get('status')!r}")
+        check("T25-4: task_state returned",
+              isinstance(result.get("task_state"), dict),
+              f"got: {result.get('task_state')!r}")
+    except Exception:
+        print("  ERROR:", traceback.format_exc())
+
+
 total = _PASS + _FAIL
 print(f"\n{'='*50}")
 print(f"  {_PASS}/{total} passed{'  ALL PASS' if _FAIL == 0 else ''}")

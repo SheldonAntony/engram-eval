@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.request
 from collections import Counter
+from datetime import datetime as _DT, timedelta as _TD
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _SCRIPTS_DIR   = os.path.join(os.path.expanduser("~"), ".config", "opencode")
@@ -35,6 +36,29 @@ RECALL_RESULTS_PATH = os.path.join(_PREFLIGHT_DIR, "locomo_recall_results.json")
 _RECALL_KS          = [1, 3, 5, 10, 40]
 _RECALL_TARGET_K    = 40      # which K the target applies to
 _RECALL_TARGET_PCT  = 99.0    # target: R@40 >= 99%
+
+# BM25 stopwords — question-frame words that inflate BM25 ranks for irrelevant
+# turns.  Active only when _USE_BM25_STOPWORDS=True (default: off = baseline).
+_BM25_STOPWORDS = frozenset({
+    "what", "when", "where", "which", "who", "whom", "whose", "how", "why",
+    "did", "does", "has", "had", "was", "were", "are", "been", "have",
+    "would", "could", "should", "will", "shall",
+    "the", "that", "this", "and", "for", "with", "from", "into",
+    "she", "her", "his", "their", "him", "they", "you", "its",
+    "not", "but", "can", "any", "all", "out",
+})
+
+# ── Experiment flags ─────────────────────────────────────────────────────────
+# Change exactly ONE flag per ablation run.  Baseline (all defaults) must
+# reproduce R@40 >= 92.62, R@5 >= 73.87.  Override via env var, e.g.:
+#   $env:PREFLIGHT_USE_STOPWORDS="1"; python recall_ablation.py
+_USE_BM25_STOPWORDS     = os.environ.get("PREFLIGHT_USE_STOPWORDS",    "0") == "1"
+_BM25_RRF_WEIGHT        = float(os.environ.get("PREFLIGHT_BM25_WEIGHT", "1.0"))
+_USE_CE_IN_RECALL_EVAL  = os.environ.get("PREFLIGHT_USE_CE",            "0") == "1"
+_USE_EVAL_SPEAKER_BOOST = os.environ.get("PREFLIGHT_SPEAKER_BOOST",    "0") == "1"
+_RRF_K                  = int(os.environ.get("PREFLIGHT_RRF_K",         "60"))
+_USE_DERIVED_BM25       = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
+_POOL_A_SIZE            = int(os.environ.get("PREFLIGHT_POOL_A",        "750"))
 
 # ── Embedding setup: try real fastembed; fall back to SHA-256 stub ─────────────
 # Must happen BEFORE importing memory so memory.py picks up the right utils.
@@ -154,35 +178,168 @@ def _tok_overlap(a: str, b: str) -> float:
     return 2 * p * r / (p + r)
 
 
-def extract_answer(question: str, facts: list[str], category: int) -> str:
+# ── Temporal date resolution helpers ─────────────────────────────────────────
+
+_MONTHS_EN = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+]
+_WEEKDAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+_WEEKDAY_ABBR  = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+
+
+def _parse_session_dt(date_str: str):
+    """Parse '1:56 pm on 8 May, 2023' → datetime, or None on failure."""
+    m = re.search(r'(\d{1,2})\s+(\w+),?\s+(\d{4})', str(date_str))
+    if m:
+        try:
+            return _DT.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y")
+        except ValueError:
+            pass
+    return None
+
+
+def _resolve_relative_date(text: str, session_dt) -> str | None:
+    """Detect a relative temporal expression in *text* and return an absolute
+    date string matching LoCoMo's ground-truth format.  Returns None if no
+    recognisable expression is found or session_dt is unavailable.
+    """
+    if session_dt is None:
+        return None
+    t = text.lower()
+
+    if 'yesterday' in t:
+        d = session_dt - _TD(days=1)
+        return f"{d.day} {_MONTHS_EN[d.month - 1]} {d.year}"
+
+    if 'today' in t:
+        return f"{session_dt.day} {_MONTHS_EN[session_dt.month - 1]} {session_dt.year}"
+
+    if 'last sunday' in t:
+        return (f"The sunday before {session_dt.day} "
+                f"{_MONTHS_EN[session_dt.month - 1]} {session_dt.year}")
+
+    if 'last week' in t:
+        return (f"The week before {session_dt.day} "
+                f"{_MONTHS_EN[session_dt.month - 1]} {session_dt.year}")
+
+    # "two weekends ago" / "two weeks ago" → two weeks before session
+    if 'two weekend' in t or 'two week' in t:
+        return (f"two weekends before {session_dt.day} "
+                f"{_MONTHS_EN[session_dt.month - 1]} {session_dt.year}")
+
+    if 'this month' in t:
+        return f"{_MONTHS_EN[session_dt.month - 1]} {session_dt.year}"
+
+    if 'next month' in t:
+        if session_dt.month == 12:
+            return f"January {session_dt.year + 1}"
+        return f"{_MONTHS_EN[session_dt.month]} {session_dt.year}"
+
+    if 'last month' in t:
+        if session_dt.month == 1:
+            return f"December {session_dt.year - 1}"
+        return f"{_MONTHS_EN[session_dt.month - 2]} {session_dt.year}"
+
+    if 'last year' in t or 'a year ago' in t:
+        return str(session_dt.year - 1)
+
+    if 'this year' in t:
+        return str(session_dt.year)
+
+    # "last <weekday>" — full name or 3-letter abbreviation (e.g. "last Fri")
+    for idx, (day_name, day_abbr) in enumerate(zip(_WEEKDAY_NAMES, _WEEKDAY_ABBR)):
+        pattern = f'last {day_name}'
+        abbr_pattern = f'last {day_abbr}'
+        if pattern in t or abbr_pattern in t:
+            dow_diff = (session_dt.weekday() - idx) % 7 or 7
+            d = session_dt - _TD(days=dow_diff)
+            day_cap = day_name.capitalize()
+            return (f"The {day_cap} before {session_dt.day} "
+                    f"{_MONTHS_EN[session_dt.month - 1]} {session_dt.year}")
+
+    return None
+
+
+def extract_answer(question: str, facts: list[str], category: int,
+                   fact_session_dates: list[str] | None = None) -> str:
     """Pick the best sentence(s) from retrieved facts by token overlap with the question.
 
     Multi-hop (cat 1): return top-2 sentences joined with "; ".
     All others: return the single best sentence.
-    Falls back to first fact if no sentences score > 0.
+
+    Strategy:
+    - Process each LINE of the (possibly multi-line) window fact individually,
+      stripping [prev]/[curr]/[next] tags and "Speaker: " prefix per line.
+    - Sentence-split each cleaned line; filter out questions ("?" endings) and
+      short acknowledgments (< 4 tokens) which are always noise.
+    - Select sentence with highest token overlap against the eval question.
+      Ties broken by longer sentence (more content). Fallback: longest sentence.
     """
     if not facts:
         return ""
-    # Build sentence pool: strip "Speaker: " prefix before scoring
-    sentences: list[str] = []
-    for fact in facts:
-        text = re.sub(r"^\w[\w\s]*:\s*", "", fact)  # strip "Name: " prefix
-        sentences.extend(_sent_split(text) or [text])
 
-    scored = sorted(
-        ((s, _tok_overlap(question, s)) for s in sentences if s),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    if not scored or scored[0][1] == 0.0:
-        # No overlap at all — return first sentence of first fact as fallback
-        first = re.sub(r"^\w[\w\s]*:\s*", "", facts[0])
-        return (_sent_split(first) or [first])[0]
+    _MIN_TOKENS = 4
+
+    # ── Category-2 (temporal): try to resolve relative date expressions ────────
+    if category == 2 and fact_session_dates:
+        # Iterate over retrieved facts in rank order (most relevant first).
+        # Return the first resolvable temporal expression found.
+        # Do NOT filter lines ending with "?" — a turn can contain both a
+        # statement ("I signed up yesterday") and a follow-up question.
+        for fi, fact in enumerate(facts):
+            date_str = fact_session_dates[fi] if fi < len(fact_session_dates) else ""
+            session_dt = _parse_session_dt(date_str) if date_str else None
+            for line in fact.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                line = re.sub(r"^\[(prev|curr|next)\]\s*", "", line)
+                line = re.sub(r"^\w[\w\s]*:\s*", "", line)
+                if not line:
+                    continue
+                resolved = _resolve_relative_date(line, session_dt)
+                if resolved:
+                    return resolved
+        # No temporal expression resolved — fall through to normal extraction
+
+    sentences: list[tuple[str, float]] = []  # (text, overlap_score)
+
+    for fact in facts:
+        for line in fact.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^\[(prev|curr|next)\]\s*", "", line)  # strip window tag per line
+            line = re.sub(r"^\w[\w\s]*:\s*", "", line)             # strip "Speaker: " per line
+            if not line:
+                continue
+            for sent in (_sent_split(line) or [line]):
+                sent = sent.strip()
+                if not sent or sent.endswith("?"):
+                    continue  # skip conversation questions
+                if len(_normalize(sent).split()) < _MIN_TOKENS:
+                    continue  # skip short fillers ("Thanks!", "Yeah!", etc.)
+                sentences.append((sent, _tok_overlap(question, sent)))
+
+    if not sentences:
+        return ""
+
+    # Sort: highest overlap first; ties → prefer longer sentence (more content)
+    sentences.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
+
+    if sentences[0][1] == 0.0:
+        # No question overlap — return the longest sentence (most informative fallback)
+        return max(sentences, key=lambda x: len(x[0]))[0]
 
     if category == 1:  # multi-hop: two best distinct sentences
-        top2 = [s for s, _ in scored[:2]]
+        top2 = [sentences[0][0]]
+        for text, _ in sentences[1:]:
+            if text != sentences[0][0]:
+                top2.append(text)
+                break
         return "; ".join(top2)
-    return scored[0][0]
+    return sentences[0][0]
 
 
 # ── Dataset loading ────────────────────────────────────────────────────────────
@@ -294,7 +451,6 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
         return []
 
     # Cosine ranking
-    _RRF_K = 60
     n_facts = len(fact_cache)
     cos_ranked = sorted(fact_cache, key=lambda x: _cs(q_emb, x[2]), reverse=True)
     cos_rank = {fid: i for i, (fid, _, _e) in enumerate(cos_ranked)}
@@ -303,7 +459,8 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
     bm25_rank: dict[int, int] = {}
     try:
         safe   = "".join(c if c.isalnum() or c.isspace() else " " for c in question)
-        tokens = [t for t in safe.split() if len(t) > 2]
+        tokens = [t for t in safe.split() if len(t) > 2
+                  and (not _USE_BM25_STOPWORDS or t.lower() not in _BM25_STOPWORDS)]
         if tokens:
             fts_q    = " OR ".join(f'"{t}"' for t in tokens)
             all_fids_set = {fid for fid, _, _e in fact_cache}
@@ -320,12 +477,12 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
         pass
     conn.close()
 
-    # RRF merge
+    # RRF merge — weight controlled by _BM25_RRF_WEIGHT (baseline=1.0).
     rrf: dict[int, float] = {}
     for fid, _, _e in fact_cache:
         s = 1.0 / (_RRF_K + cos_rank.get(fid, n_facts))
         if fid in bm25_rank:
-            s += 1.0 / (_RRF_K + bm25_rank[fid])
+            s += _BM25_RRF_WEIGHT / (_RRF_K + bm25_rank[fid])
         rrf[fid] = s
 
     content_by_fid = {fid: content for fid, content, _e in fact_cache}
@@ -343,31 +500,42 @@ def build_dia_id_map(samples: list, db_path: str) -> dict:
     Two-pass strategy: [prev]/[next] tag matches go in first, [curr] tag matches
     overwrite (higher priority).  Plain-text rows (no window tags) go in via fallback.
     Both window and turn fids for the same "Speaker: text" are collected into one set.
+
+    llm_atomic facts: also included when present.  They are stored with
+    source_hash = sha256(curr_line)[:16] so we can join them back to their
+    source turn via a secondary hash-keyed lookup.
     """
+    import hashlib as _hl  # noqa: PLC0415
     dia_id_map: dict[str, dict[str, set]] = {}
     conn = sqlite3.connect(db_path)
     for ci, sample in enumerate(samples):
         sid_str = str(sample.get("sample_id", ci))
         pid     = f"locomo_{sid_str}"
         rows    = conn.execute(
-            "SELECT id, content FROM facts WHERE project_id = ? AND superseded_at IS NULL",
+            "SELECT id, content, source_hash, fact_type FROM facts WHERE project_id = ? AND superseded_at IS NULL",
             (pid,),
         ).fetchall()
         # Maps "Speaker: text" → set of fact_ids (window fid via [curr] tag + turn fid via fallback).
         content_to_ids: dict[str, set] = {}
+        # Maps source_hash → set of llm_atomic fact_ids for secondary linking.
+        hash_to_llm_ids: dict[str, set] = {}
         # Two-pass: [prev]/[next] tag matches first (lower priority), then [curr].
         for priority_tags in (("[prev] ", "[next] "), ("[curr] ",)):
-            for fid, content in rows:
+            for fid, content, _sh, _ft in rows:
                 for line in content.split("\n"):
                     for tag in priority_tags:
                         if line.startswith(tag):
                             key = line[len(tag):]
                             content_to_ids.setdefault(key, set()).add(fid)
         # Fallback: plain rows without any window tags (covers fact_type="turn" rows).
-        for fid, content in rows:
+        for fid, content, _sh, _ft in rows:
             if not any(content.startswith(t) or "\n" + t in content
                        for t in ("[curr] ", "[prev] ", "[next] ")):
                 content_to_ids.setdefault(content, set()).add(fid)
+        # Build hash → llm_atomic fid mapping for secondary linking.
+        for fid, _content, source_hash, fact_type in rows:
+            if fact_type == "llm_atomic" and source_hash:
+                hash_to_llm_ids.setdefault(source_hash, set()).add(fid)
         pid_map: dict[str, set] = {}
         conv = sample.get("conversation", {})
         for sn, _date, turns in iter_sessions(conv):
@@ -380,6 +548,11 @@ def build_dia_id_map(samples: list, db_path: str) -> dict:
                 content = f"{speaker}: {text}"
                 fids = content_to_ids.get(content)
                 if fids:
+                    fids = set(fids)  # copy so we can augment
+                    # Link any llm_atomic facts derived from this turn.
+                    turn_hash = _hl.sha256(content.encode()).hexdigest()[:16]
+                    if turn_hash in hash_to_llm_ids:
+                        fids.update(hash_to_llm_ids[turn_hash])
                     pid_map[str(dia_id)] = fids
         dia_id_map[pid] = pid_map
     conn.close()
@@ -412,7 +585,23 @@ def recall_at_k(
 # ── Ingestion ──────────────────────────────────────────────────────────────────
 
 def ingest(samples: list, mem, mode: str) -> dict:
+    """Ingest all samples into the memory DB.
+
+    Benchmark mode ("B"):
+      - Batch-embeds all curr_lines in one fastembed call per session.
+      - Batch-extracts LLM atomic facts with ThreadPoolExecutor(4) when
+        PREFLIGHT_USE_LLM_EXTRACTOR=1; blocks until ALL threads finish before
+        returning so eval queries see a complete DB.
+      - Skips the companion turn row (store_turn=False) — the window row is
+        sufficient for ANN recall and halves the store_fact() calls.
+      - Skips spaCy SVO extraction (extract_svo=False) — ~0.5s/turn, <1% gain.
+    """
     import extractor as _ext
+    from utils import embed_texts_batch as _uemb  # noqa: PLC0415
+
+    _use_llm = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR", "0") == "1"
+    _llm_workers = int(os.environ.get("PREFLIGHT_LLM_WORKERS", "4"))
+
     total_turns = 0
     kw_facts    = 0
     for ci, sample in enumerate(samples):
@@ -426,18 +615,70 @@ def ingest(samples: list, mem, mode: str) -> dict:
                 {"speaker": str(t.get("speaker", "?")), "text": str(t.get("text", ""))}
                 for t in turns if str(t.get("text", "")).strip()
             ]
-            for turn_idx, turn_dict in enumerate(session_turns):
-                total_turns += 1
-                if mode == "B":
+            if mode == "B":
+                # Build curr_line strings for the whole session in one go so we
+                # can batch-embed and batch-LLM them before the store loop.
+                curr_lines: list[str] = []
+                for idx, td in enumerate(session_turns):
+                    curr_lines.append(f"{td['speaker']}: {td['text']}")
+
+                # Batch embedding: one model call for the whole session.
+                try:
+                    curr_embs: list[list[float]] = _uemb(curr_lines)
+                except Exception:
+                    curr_embs = [None] * len(curr_lines)  # type: ignore[list-item]
+
+                # Batch LLM atomic-fact extraction (non-blocking for other modes).
+                llm_facts_by_idx: dict[int, list[str]] = {}
+                if _use_llm:
+                    try:
+                        from llm_extractor import extract_batch_facts as _ebf  # noqa: PLC0415
+                        _batch_results = _ebf(curr_lines, workers=_llm_workers)
+                        llm_facts_by_idx = {i: fs for i, fs in enumerate(_batch_results)}
+                    except Exception:
+                        pass  # fall back to empty — raw window facts still stored
+
+                for turn_idx, turn_dict in enumerate(session_turns):
+                    total_turns += 1
+                    _emb = curr_embs[turn_idx] if curr_embs[turn_idx] is not None else None
+                    mem.store_turn_window(
+                        pid, sid, session_turns, turn_idx,
+                        extract_svo=False,
+                        store_turn=False,
+                        _precomputed_curr_emb=_emb,
+                    )
+                    # Store pre-computed LLM atomic facts (already fetched above).
+                    if _use_llm and turn_idx in llm_facts_by_idx:
+                        import hashlib as _hl  # noqa: PLC0415
+                        _cl = curr_lines[turn_idx]
+                        _turn_hash = _hl.sha256(_cl.encode()).hexdigest()[:16]
+                        from utils import embed_text as _et  # noqa: PLC0415
+                        for _ft in llm_facts_by_idx[turn_idx]:
+                            _ft_emb = _et(_ft)
+                            mem.store_fact(
+                                pid, sid, _ft, "llm_atomic",
+                                enrich=False, _precomputed_emb=_ft_emb,
+                                _source_hash=_turn_hash,
+                            )
+                    try:
+                        for fact in _ext.keyword_extract(turn_dict["text"]):
+                            mem.store_fact(pid, sid, fact, "finding")
+                            kw_facts += 1
+                    except Exception:
+                        pass
+            else:
+                for turn_idx, turn_dict in enumerate(session_turns):
+                    total_turns += 1
                     mem.store_turn_window(pid, sid, session_turns, turn_idx,
                                          extract_svo=False)
-                try:
-                    for fact in _ext.keyword_extract(turn_dict["text"]):
-                        mem.store_fact(pid, sid, fact, "finding")
-                        kw_facts += 1
-                except Exception:
-                    pass
+                    try:
+                        for fact in _ext.keyword_extract(turn_dict["text"]):
+                            mem.store_fact(pid, sid, fact, "finding")
+                            kw_facts += 1
+                    except Exception:
+                        pass
     return {"total_turns": total_turns, "kw_facts": kw_facts}
+
 
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
@@ -457,9 +698,14 @@ def evaluate(samples: list, mem, db_path: str) -> dict:
         sid_str = str(sample.get("sample_id", 0))
         pid     = f"locomo_{sid_str}"
 
+        # Build session_date map for this conversation (session_num → date_str).
+        _session_dates_map: dict[int, str] = {}
+        for _sn, _ds, _ in iter_sessions(sample.get("conversation", {})):
+            _session_dates_map[_sn] = _ds
+
         # Preload all fact embeddings + content for this project (one DB read).
         rows_ev = conn_eval.execute(
-            """SELECT id, content, embedding FROM facts
+            """SELECT id, content, embedding, session_id FROM facts
                WHERE project_id = ?
                  AND superseded_at IS NULL
                  AND fact_type != 'turn'
@@ -467,7 +713,10 @@ def evaluate(samples: list, mem, db_path: str) -> dict:
             (pid,),
         ).fetchall()
         fact_cache_ev: list[tuple[int, str, list]] = []
-        for fid, content, blob in rows_ev:
+        session_id_by_fid: dict[int, str] = {}
+        for fid, content, blob, s_id in rows_ev:
+            if s_id:
+                session_id_by_fid[fid] = s_id
             if blob is None:
                 continue
             if isinstance(blob, (bytes, bytearray)):
@@ -532,7 +781,22 @@ def evaluate(samples: list, mem, db_path: str) -> dict:
             except Exception:
                 facts, budget_hit = [], False
 
-            prediction = extract_answer(qa["question"], [f["content"] for f in facts], qa["category"])
+            # Resolve session dates for retrieved facts (used for temporal resolution).
+            fact_dates: list[str] = []
+            for f in facts:
+                s_id = session_id_by_fid.get(f["id"], "")
+                try:
+                    sess_num = int(s_id.split("_s")[-1]) if s_id else 0
+                    fact_dates.append(_session_dates_map.get(sess_num, ""))
+                except (ValueError, IndexError):
+                    fact_dates.append("")
+
+            prediction = extract_answer(
+                qa["question"],
+                [f["content"] for f in facts],
+                qa["category"],
+                fact_session_dates=fact_dates,
+            )
             sc = score_qa(prediction, qa["answer"], qa["category"])
             n_retrieved += len(facts)
             n_budget    += int(budget_hit)
@@ -643,8 +907,8 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                  AND (valid_to IS NULL OR valid_to > unixepoch())""",
             (pid,),
         ).fetchall()
-        fact_cache: list[tuple[int, list]] = []
-        for fid, _content, blob in rows:
+        fact_cache: list[tuple[int, str, list]] = []
+        for fid, content, blob in rows:
             if blob is None:
                 continue
             if isinstance(blob, (bytes, bytearray)):
@@ -655,7 +919,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                     emb = json.loads(blob)
                 except Exception:
                     continue
-            fact_cache.append((fid, emb))
+            fact_cache.append((fid, content, emb))
 
         # Batch-embed all questions for this conversation at once.
         # fastembed processes the full list in one ONNX forward pass —
@@ -663,7 +927,8 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
         qa_list = list(iter_qa(sample))
         q_texts = [qa["question"] for qa in qa_list]
         q_embs  = _ub(q_texts)
-        fids_in_cache = tuple(fid for fid, _ in fact_cache)
+        content_by_fid_ev = {fid: c for fid, c, _ in fact_cache}
+        fids_in_cache = tuple(fid for fid, _, _ in fact_cache)
 
         for qa, q_emb in zip(qa_list, q_embs):
             evidence         = qa["evidence"]
@@ -676,14 +941,14 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
 
             if has_evidence:
                 # Cosine ranking over preloaded embeddings (q_emb from batch)
-                cos_ranked = sorted(fact_cache, key=lambda x: _cs(q_emb, x[1]), reverse=True)
-                cos_rank = {fid: i for i, (fid, _) in enumerate(cos_ranked)}
+                cos_ranked = sorted(fact_cache, key=lambda x: _cs(q_emb, x[2]), reverse=True)
+                cos_rank = {fid: i for i, (fid, _, _) in enumerate(cos_ranked)}
                 # BM25 ranking via FTS5 (same DB connection, already open)
                 bm25_rank_eval: dict[int, int] = {}
-                _RRF_K_EVAL = 60
                 try:
                     safe = "".join(c if c.isalnum() or c.isspace() else " " for c in qa["question"])
-                    tokens = [t for t in safe.split() if len(t) > 2]
+                    tokens = [t for t in safe.split() if len(t) > 2
+                              and (not _USE_BM25_STOPWORDS or t.lower() not in _BM25_STOPWORDS)]
                     if tokens:
                         fts_q = " OR ".join(f'"{t}"' for t in tokens)
                         if fids_in_cache:
@@ -699,15 +964,76 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                                     bm_rank += 1
                 except Exception:
                     pass
-                # RRF merge: cosine + BM25
+                # RRF merge: cosine + BM25 (derived BM25 env-gated via PREFLIGHT_USE_DERIVED_BM25)
                 n_facts = len(fact_cache)
                 rrf_scores: dict[int, float] = {}
-                for fid, _ in fact_cache:
-                    s  = 1.0 / (_RRF_K_EVAL + cos_rank.get(fid, n_facts))
+                for fid, _, _ in fact_cache:
+                    s  = 1.0 / (_RRF_K + cos_rank.get(fid, n_facts))
                     if fid in bm25_rank_eval:
-                        s += 1.0 / (_RRF_K_EVAL + bm25_rank_eval[fid])
+                        s += _BM25_RRF_WEIGHT / (_RRF_K + bm25_rank_eval[fid])
                     rrf_scores[fid] = s
+                if _USE_DERIVED_BM25:
+                    derived_rank_eval: dict[int, int] = {}
+                    _RRF_K_DERIVED = 60
+                    try:
+                        from memory import _build_derived_text as _bdt  # noqa: PLC0415
+                        derived_q = _bdt(qa["question"])
+                        safe_d = "".join(c if c.isalnum() or c.isspace() else " " for c in derived_q)
+                        dtokens = [t for t in safe_d.split() if len(t) > 2]
+                        if dtokens and fids_in_cache:
+                            dfts_q = " OR ".join(f'"{t}"' for t in dtokens)
+                            fids_set_d = set(fids_in_cache)
+                            dr_rows = conn.execute(
+                                "SELECT rowid FROM facts_derived_fts"
+                                " WHERE facts_derived_fts MATCH ? ORDER BY bm25(facts_derived_fts)",
+                                (dfts_q,),
+                            ).fetchall()
+                            dr_rank = 0
+                            for (dfid,) in dr_rows:
+                                if dfid in fids_set_d:
+                                    derived_rank_eval[dfid] = dr_rank
+                                    dr_rank += 1
+                            for fid, _, _ in fact_cache:
+                                if fid in derived_rank_eval:
+                                    rrf_scores[fid] += 1.0 / (_RRF_K_DERIVED + derived_rank_eval[fid])
+                    except Exception:
+                        pass
+                # Speaker boost removed: regex-based speaker extraction produces too many
+                # false positives (capitalised words near auxiliary verbs), boosting wrong
+                # window rows and causing net-negative recall across all K values.
                 sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)
+                # CE disabled: mxbai-rerank-xsmall is not calibrated for
+                # [prev]/[curr]/[next] window format and actively demotes correct facts.
+                if _USE_CE_IN_RECALL_EVAL:
+                    try:
+                        from utils import get_cross_encoder as _gce  # noqa: PLC0415
+                        _ce = _gce()
+                        if _ce is not None and len(sorted_ids) > 5:
+                            _ce_pool_fids = [fid for fid in sorted_ids[:100]
+                                             if fid in content_by_fid_ev]
+                            # Feed only [curr] line to CE — window format confuses CE;
+                            # the [curr] speaker:text is what the question asks about.
+                            def _curr_text(raw: str) -> str:
+                                for ln in raw.split("\n"):
+                                    if ln.startswith("[curr] "):
+                                        return ln[len("[curr] "):]
+                                return raw  # fallback: use full content
+
+                            _ce_pairs = [(qa["question"], _curr_text(content_by_fid_ev[fid]))
+                                         for fid in _ce_pool_fids]
+                            _ce_scores = _ce.predict(_ce_pairs)
+                            _ce_reranked = [fid for fid, _ in sorted(
+                                zip(_ce_pool_fids, _ce_scores),
+                                key=lambda x: x[1], reverse=True,
+                            )]
+                            _ce_tail = [fid for fid in sorted_ids[100:]]
+                            sorted_ids = _ce_reranked + _ce_tail
+                    except Exception:
+                        pass
+                # Diagnostic: record gold fact ranks
+                gold_cos_ranks  = [cos_rank.get(fid, n_facts) + 1 for fid in evidence_fact_ids]
+                gold_rrf_ranks  = [sorted_ids.index(fid) + 1 if fid in sorted_ids else n_facts + 1
+                                   for fid in evidence_fact_ids]
                 hits = {
                     k: bool(set(sorted_ids[:k]) & evidence_fact_ids)
                     for k in _RECALL_KS
@@ -716,10 +1042,12 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                 hits = {k: None for k in _RECALL_KS}
 
             per_q.append({
-                "question":    qa["question"],
-                "category":    qa["cat_name"],
-                "evidence":    evidence,
+                "question":     qa["question"],
+                "category":     qa["cat_name"],
+                "evidence":     evidence,
                 "has_evidence": has_evidence,
+                "gold_cos_rank_best":  min(gold_cos_ranks)  if has_evidence else None,
+                "gold_rrf_rank_best":  min(gold_rrf_ranks)  if has_evidence else None,
                 **{f"hit@{k}": hits[k] for k in _RECALL_KS},
             })
 

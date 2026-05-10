@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import threading
 
 # ─── Path setup ───────────────────────────────────────────────────────────────
 
@@ -44,6 +45,10 @@ MEMORY_PY     = str(_SCRIPTS_DIR / "memory.py")
 TASKS_PY      = str(_SCRIPTS_DIR / "tasks.py")
 CLASSIFIER_PY = str(_SCRIPTS_DIR / "classifier.py")
 EXTRACTOR_PY  = str(_SCRIPTS_DIR / "extractor.py")
+
+# Make opencode scripts importable for direct-import tools (context_broker, etc.)
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 # Fail fast at startup rather than producing cryptic subprocess errors later.
 for _required in (MEMORY_PY, TASKS_PY, CLASSIFIER_PY):
@@ -74,6 +79,48 @@ for _candidate in _VENV_CANDIDATES:
         # bin/python links created by virtualenv on WSL-mounted paths).
         # Fall through and try the next candidate.
         pass
+
+# ─── Lazy context broker import (avoids fastembed at startup) ───────────────────
+
+_broker_mod = None
+
+
+def _get_broker():
+    """Lazy-load context_broker so fastembed isn't imported at MCP startup."""
+    global _broker_mod
+    if _broker_mod is None:
+        import importlib
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "context_broker",
+            str(_SCRIPTS_DIR / "context_broker.py"),
+        )
+        _broker_mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(_broker_mod)  # type: ignore[union-attr]
+    return _broker_mod
+
+
+# Tool-use instructions for the user's LLM (surfaced via get_context response)
+TOOL_USE_INSTRUCTIONS = """
+You have access to an MCP memory server (preflight). Call it BEFORE answering when:
+- User refers to previous work/sessions/experiments/configs/decisions/preferences
+- User uses vague references: 'it', 'that', 'same', 'previous', 'continue', 'the better one'
+- Request requires past state not visible in the current context window
+- You are below 90% confident about what past context the user means
+
+Primary tools:
+  resolve_missing_context — resolve what you don't know from stored memory/history
+  submit_clarification    — save user's clarification answer, update task state
+  save_turn               — persist each user/assistant turn (call every turn)
+  get_context             — retrieve facts + slots at session start
+  store_memory            — save important facts after every response
+  auto_extract            — extract facts from every AI response (non-blocking)
+
+When resolve_missing_context returns status='needs_user': ask ONLY the first
+question listed in needs_user_questions, using its options. Do not ask multiple
+clarification questions at once. After user answers, call submit_clarification.
+""".strip()
+
 
 # ─── Required slots per task type ─────────────────────────────────────────────
 
@@ -328,6 +375,89 @@ def tool_get_graph(
         return {"error": str(exc), "root": None, "neighbours": []}
 
 
+def tool_resolve_missing_context(
+    missing: list,
+    project_id: str,
+    session_id: str,
+    user_message: str = "",
+    project_hint: str | None = None,
+    candidate_topics: list | None = None,
+) -> dict:
+    """Resolve what the LLM is missing from stored memory, history, and context slots.
+
+    Primary entry point for the LLM when it lacks past context. Searches:
+    active task state → conversation history → cross-session → long-term memory.
+
+    Returns a context packet with filled slots, evidence, and — if needed —
+    structured clarification questions with options for the user.
+    """
+    try:
+        broker = _get_broker()
+        return broker.resolve_missing_context(
+            missing=missing,
+            project_id=project_id,
+            session_id=session_id,
+            user_message=user_message,
+            project_hint=project_hint,
+            candidate_topics=candidate_topics,
+        )
+    except Exception as exc:
+        return {"error": str(exc), "status": "error", "filled": {}, "evidence": []}
+
+
+def tool_submit_clarification(
+    slot_name: str,
+    value: str,
+    project_id: str,
+    session_id: str,
+) -> dict:
+    """Save the user's answer to a clarification question.
+
+    Call after presenting a needs_user question from resolve_missing_context
+    and receiving the user's choice. Updates context_slots and active task state.
+    Returns the updated task state so the LLM can continue with full context.
+    """
+    try:
+        broker = _get_broker()
+        return broker.submit_clarification_answer(
+            slot_name=slot_name,
+            value=value,
+            project_id=project_id,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        return {"error": str(exc), "saved": False}
+
+
+def tool_save_turn(
+    project_id: str,
+    session_id: str,
+    role: str,
+    content: str,
+) -> dict:
+    """Persist a raw conversation turn to the transcript store.
+
+    Call every turn (both user and assistant). This keeps the conversation
+    history searchable even when outside the LLM's context window, enabling
+    resolve_missing_context to find context from earlier in the conversation.
+
+    role: 'user' | 'assistant'
+    """
+    try:
+        broker = _get_broker()
+        # Store turn (embedding is computed in a background thread to avoid blocking)
+        turn_id = broker.save_turn(
+            project_id=project_id,
+            session_id=session_id,
+            role=role,
+            content=content,
+            embed=True,
+        )
+        return {"saved": True, "turn_id": turn_id}
+    except Exception as exc:
+        return {"error": str(exc), "saved": False}
+
+
 # ─── MCP server (stdio transport) ─────────────────────────────────────────────
 
 try:
@@ -484,6 +614,96 @@ def _build_mcp_server() -> "Server":
                     "required": ["project_id", "session_id"],
                 },
             ),
+            mcp_types.Tool(
+                name="resolve_missing_context",
+                description=(
+                    "Resolve what you are missing from stored memory, conversation history, "
+                    "and context slots. Call BEFORE answering when the user refers to past "
+                    "sessions, previous experiments, vague references ('it', 'that run', "
+                    "'what we decided'), or when you are below 90%% confident about past context. "
+                    "Searches: active task state \u2192 conversation history \u2192 cross-session \u2192 long-term memory. "
+                    "Returns filled slots + evidence, or structured clarification questions."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "missing": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "List of things you are missing. E.g. "
+                                "[\"what does 'that run' refer to?\", "
+                                "\"what was the accepted config?\"]"
+                            ),
+                        },
+                        "project_id":  {"type": "string"},
+                        "session_id":  {"type": "string"},
+                        "user_message": {
+                            "type": "string",
+                            "description": "The user's current message (for semantic search).",
+                        },
+                        "project_hint": {
+                            "type": "string",
+                            "description": "Optional: your best guess at the topic/project.",
+                        },
+                        "candidate_topics": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional: list of what you think the user may mean.",
+                        },
+                    },
+                    "required": ["missing", "project_id", "session_id"],
+                },
+            ),
+            mcp_types.Tool(
+                name="submit_clarification",
+                description=(
+                    "Save the user's answer to a clarification question that was raised by "
+                    "resolve_missing_context. Call after presenting the question with its "
+                    "options and receiving the user's choice. Updates context slots and "
+                    "active task state. Returns the updated task state."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "slot_name":  {
+                            "type": "string",
+                            "description": "The slot name from the needs_user_questions entry.",
+                        },
+                        "value":      {"type": "string"},
+                        "project_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                    },
+                    "required": ["slot_name", "value", "project_id", "session_id"],
+                },
+            ),
+            mcp_types.Tool(
+                name="save_turn",
+                description=(
+                    "Persist a raw conversation turn (user or assistant message) to the "
+                    "searchable transcript store. Call every turn so the conversation "
+                    "history remains available even outside the LLM context window. "
+                    "This enables resolve_missing_context to find context from earlier "
+                    "in the conversation."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["user", "assistant"],
+                            "description": "Who produced this turn.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The full text of the turn.",
+                        },
+                    },
+                    "required": ["project_id", "session_id", "role", "content"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -532,6 +752,29 @@ def _build_mcp_server() -> "Server":
                 result = tool_consolidate_memories(
                     project_id=arguments["project_id"],
                     session_id=arguments["session_id"],
+                )
+            elif name == "resolve_missing_context":
+                result = tool_resolve_missing_context(
+                    missing=arguments["missing"],
+                    project_id=arguments["project_id"],
+                    session_id=arguments["session_id"],
+                    user_message=arguments.get("user_message", ""),
+                    project_hint=arguments.get("project_hint"),
+                    candidate_topics=arguments.get("candidate_topics"),
+                )
+            elif name == "submit_clarification":
+                result = tool_submit_clarification(
+                    slot_name=arguments["slot_name"],
+                    value=arguments["value"],
+                    project_id=arguments["project_id"],
+                    session_id=arguments["session_id"],
+                )
+            elif name == "save_turn":
+                result = tool_save_turn(
+                    project_id=arguments["project_id"],
+                    session_id=arguments["session_id"],
+                    role=arguments["role"],
+                    content=arguments["content"],
                 )
             else:
                 result = {"error": f"Unknown tool: {name}"}
