@@ -40,6 +40,10 @@ We care most about **R@3** (production quality) and **R@40** (pipeline ceiling â
 
 ### Repo 1: `C:\Users\Sheldon Antony\.config\preflight\` (benchmark/eval)
 
+**GitHub remote:** `https://github.com/SheldonAntony/engram-eval.git` (branch: `master`)
+
+
+
 | File | Purpose |
 |------|---------|
 | `eval_locomo.py` | **CORE** â€” full retrieval pipeline + recall scoring. ALL pipeline logic lives here. |
@@ -61,6 +65,10 @@ We care most about **R@3** (production quality) and **R@40** (pipeline ceiling â
 | `bench_v*.log` | Full stdout logs of each benchmark run |
 
 ### Repo 2: `C:\Users\Sheldon Antony\.config\opencode\` (production system)
+
+**GitHub remote:** `https://github.com/SheldonAntony/engram.git` (branch: `main`)
+
+
 
 | File | Purpose |
 |------|---------|
