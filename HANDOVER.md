@@ -2,9 +2,9 @@
 
 > **Date:** 2026-05-16  
 > **Goal:** Maximize Recall@3 on the LoCoMo benchmark (1,531 scorable QA pairs across 10 conversations).  
-> **Current champion:** v11 — lexical channels — **R@3 = 80.47%, R@40 = 95.75% (B DB)**  
-> **Previous champion (H DB):** v8 — `bge-reranker-v2-m3` — R@3 = 80.81%, R@40 = 96.98% (not comparable, different DB)  
-> **Next AI agent:** read this top-to-bottom before touching anything.
+> **Current champion:** v12 — retrained GBM (21 feat) — **R@3 = 80.99%, R@40 = 96.34% (B DB)**  
+> **Previous champion:** v11 — lexical channels — R@3 = 80.47%, R@40 = 95.75% (B DB)  
+> **Stretch target:** R@3 ≥ 84%
 
 ---
 
@@ -31,7 +31,7 @@ We are building a **long-term conversation memory system** (the `opencode` proje
 
 We care most about **R@3** (production quality) and **R@40** (pipeline ceiling — can the right answer ever reach the reranker?).
 
-**Champion so far:** `v8` with `R@3 = 80.81%`, `R@40 = 96.98%`.  
+**Champion so far:** `v12` with `R@3 = 80.99%`, `R@40 = 96.34%` (B DB).  
 **Stretch target:** R@3 ≥ 84%.
 
 ---
@@ -48,17 +48,17 @@ We care most about **R@3** (production quality) and **R@40** (pipeline ceiling �
 |------|---------|
 | `eval_locomo.py` | **CORE** — full retrieval pipeline + recall scoring. ALL pipeline logic lives here. |
 | `recall_ablation.py` | Benchmark runner — sets env vars, calls `run_recall_eval()`, saves `locomo_recall_{tag}.json` |
-| `reranker.py` | GBM feature extraction (18 features) + `_apply_learned_rerank()` inference |
+| `reranker.py` | GBM feature extraction (21 features) + `_apply_learned_rerank()` inference |
 | `train_reranker.py` | Trains the GBM model from `featcache_*.pkl` feature cache |
 | `diag_v8.py` | Diagnostic: compares v5 vs v8 per-question at hit@3 and hit@40 |
 | `analyze_category_failures.py` | Breaks down failures by QA category (temporal/single_hop/multi_hop/open_domain) |
 | `locomo10.json` | The 10 LoCoMo conversations (source data) |
 | `locomo_eval_B.db` | SQLite DB — pre-ingested facts for all 10 conversations (Mode B corpus) |
 | `locomo_eval_H.db` | SQLite DB — alternative corpus (not the main benchmark DB — use B) |
-| `reranker_model.pkl` | Trained GBM reranker (18 features, HistGradientBoostingClassifier) |
+| `reranker_model.pkl` | Trained GBM reranker (21 features, HistGradientBoostingClassifier) |
 | `reranker_scaler.pkl` | Sklearn scaler for GBM features |
-| `reranker_metadata.json` | Contains `n_features: 18` — checked on load to guard against feature mismatch |
-| `featcache_H_pool200_broad200_rrf15_derived1_nfeat18.pkl` | Precomputed feature cache for GBM training |
+| `reranker_metadata.json` | Contains `n_features: 21` — checked on load to guard against feature mismatch |
+| `featcache_H_pool80_broad200_rrf15_derived1_nfeat21.pkl` | Precomputed feature cache for GBM training (21 features) |
 | `bge-small-engram-v3/` | Local embedding model (134 MB, sentence-transformers format) |
 | `locomo_recall_v8_bge_reranker_v2m3.json` | v8 champion result JSON |
 | `locomo_recall_v11_lexical_channels.json` | v11 result (written when v11 completes) |
@@ -104,9 +104,9 @@ Question
    │                       dedup → broad_cands (~400-800 unique fids)
    │                       Tail (facts not in pool) appended after, sorted by RRF
    │
-   ├─► [GBM Reranker]     PHASE 2 — 18-feature HistGBM scores broad_cands
-   │   (LEARNED_RERANK)    Features: cos_sim, bm25_rank, derived_rank, IDF weights, etc.
-   │                       alpha=3.0 blend: rrf_norm + 3.0*gbm_prob → sorted descending
+├─► [GBM Reranker]     PHASE 2 — 21-feature HistGBM scores broad_cands
+│   (LEARNED_RERANK)    Features: cos_sim, bm25_rank, derived_rank, name/date/bigram hits, etc.
+│                       alpha=3.0 blend: rrf_norm + 3.0*gbm_prob → sorted descending
    │
    ├─► [Coverage Guard]   PHASE 3 — Min-rank ensemble:
    │   (COVERAGE_K=40)     final_rank[fid] = min(gbm_rank[fid], rrf_rank[fid])
@@ -208,6 +208,9 @@ $env:PREFLIGHT_CE_MODEL              = "BAAI/bge-reranker-v2-m3"
 $env:PREFLIGHT_USE_LEXICAL_CHANNELS = "1"
 ```
 
+### v12 config (current champion):
+Same as v11 + retrained GBM with 21 features (added `name_token_hit_count`, `date_token_hit_count`, `bigram_hit_count`).
+
 ### How to run a benchmark:
 ```powershell
 cd "C:\Users\Sheldon Antony\.config\preflight"
@@ -244,10 +247,12 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
 - Warning "unauthenticated requests" is harmless — no HF_TOKEN needed for public models
 
 ### GBM reranker:
-- `reranker_model.pkl` — HistGradientBoostingClassifier, 18 features
+- `reranker_model.pkl` — HistGradientBoostingClassifier, **21 features**
 - `reranker_scaler.pkl` — StandardScaler for features
-- `reranker_metadata.json` — `{"n_features": 18}` — checked on load (mismatch = crash)
-- Retrain with: `python train_reranker.py` (uses `featcache_*.pkl`)
+- `reranker_metadata.json` — `{"n_features": 21}` — checked on load (mismatch = crash)
+- Features added in v12: `name_token_hit_count`, `date_token_hit_count`, `bigram_hit_count`
+- Retrain with: `python train_reranker.py --db-letter B --model-type gbm --broad-pool 200 --alpha 3.0`
+  (requires env vars: `ENGRAM_EMBED_BACKEND`, `ENGRAM_EMBED_MODEL`, `PREFLIGHT_RRF_K=15`, `PREFLIGHT_USE_DERIVED_BM25=1`)
 
 ---
 
@@ -267,6 +272,7 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
 | v10_alpha2 (CE_ALPHA=2.0) | — | 77.99% | 82.79% | 88.50% | 95.66% | REJECTED |
 | v8_bdb_control (v8 config, B DB) | 64.21% | 80.34% | 85.89% | 90.27% | 95.62% | B-DB baseline |
 | **v11_lexical_channels (B DB)** | **64.21%** | **80.47%** | **86.15%** | **90.33%** | **95.75%** | **CHAMPION (B DB)** |
+| **v12_gbm21feat (retrained GBM)** | **64.21%** | **80.99%** | **86.68%** | **91.25%** | **96.34%** | **CHAMPION (B DB)** |
 
 ### Detailed experiment decisions:
 
@@ -317,7 +323,7 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
 - Root cause unknown, but empirically: blending CE with rank_norm destroys the CE gains.
 - **CE_ALPHA IS PERMANENTLY ABANDONED**. Always use alpha=0 (pure CE replacement).
 
-#### v11 — Lexical Explicit-Memory Channels (CHAMPION — B DB)
+#### v11 — Lexical Explicit-Memory Channels
 - Hypothesis: 37 questions have gold facts that NEVER appear in the top-200 broad pool, regardless of signal. Cosine AND BM25 both miss them. These are "true pool misses."
 - Analysis by category:
   - `temporal`: 11 pool misses — questions about specific dates/times
@@ -343,6 +349,22 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
   
 - Code location: `eval_locomo.py` lines 1322–1366, gated by `PREFLIGHT_USE_LEXICAL_CHANNELS=1`.
 - **Actual impact vs v8_bdb_control (B DB):** R@3 +0.13pp (80.34→80.47), R@5 +0.26pp, R@40 +0.13pp. Multi-hop R@5 +1.42pp (81.85→83.27). All other categories flat. VERDICT: WIN.
+
+#### v12 — Retrained GBM with lexical-aware features (CHAMPION — B DB)
+- After v11 confirmed lexical channels helped, retrained GBM with 3 new features:
+  - `name_token_hit_count` — how many name tokens from question appear in fact
+  - `date_token_hit_count` — how many date/year tokens from question appear in fact
+  - `bigram_hit_count` — how many question bigrams appear in fact
+- `N_FEATURES` bumped 18 → 21. Feature cache regenerated from scratch.
+- GBM retrained with `train_reranker.py --db-letter B --model-type gbm --broad-pool 200 --alpha 3.0`
+- **Actual impact vs v11 (B DB):** R@3 +0.52pp (80.47→80.99), R@5 +0.53pp (86.15→86.68), R@40 +0.59pp (95.75→96.34). Multi-hop R@5 +1.43pp (83.27→84.70). Temporal R@5 +0.62pp. Open-domain R@5 +0.23pp. Single-hop flat at 56.18%.
+- VERDICT: **NEW CHAMPION. Retrained GBM successfully learned to use lexical channel signals.**
+
+### Single-hop weakness (persistent across all versions):
+- Single-hop R@5 stuck at 56.18% since v8_bdb_control — unaffected by any improvement
+- 10 single-hop questions are "true pool misses" — gold fact never reaches top-200
+- Remaining gap is likely a fundamental candidate pool problem, not a reranker problem
+- Next agent should diagnose single-hop failures with `diag_single_hop.py`
 
 ### Diagnostic analysis (diag_v8.py):
 
@@ -415,98 +437,64 @@ The 10th conversation is the largest. If the benchmark crashes with OOM on Conv 
 - Needs port AFTER a winning config is confirmed
 - Do NOT port until v11 results are analyzed
 
-### `reranker.py` — UNCHANGED
-- 18 features, HistGBM
-- `N_FEATURES = 18` version guard on load
+### `reranker.py` — MODIFIED (v12)
+- Added 3 lexical features: `name_token_hit_count`, `date_token_hit_count`, `bigram_hit_count`
+- `N_FEATURES = 21` version guard on load
+- Added `_get_lexical_question_features()` helper + `_name_hit_count/_date_hit_count/_bigram_hit_count`
+- `extract_features()` now accepts `question: str = ""` parameter for raw question text
+- `FEATURE_NAMES` updated from 18 → 21 entries
 
 ---
 
 ## 9. What To Do Next
 
-### ✅ DB MISMATCH RESOLVED — v8_bdb_control completed
+### ✅ v12 COMPLETE — v12 is new champion
 
-v4–v10 used H DB; v11 uses B DB. Control run `v8_bdb_control` (v8 config, B DB) is **complete**.
+v12 (retrained GBM with 21 features) beats v11 across all metrics:
+- R@3: **80.99%** (+0.52pp vs v11)
+- R@40: **96.34%** (+0.59pp vs v11)
+- All categories improved except single-hop (flat at 56.18%)
 
-**v8_bdb_control results (B DB, no lexical channels):**
-- R@3: 80.34% | R@5: 85.89% | R@40: 95.62%
-- Multi-hop R@5: 81.85%
-
-**v11 delta over control:**
-- R@3: +0.13pp | R@5: +0.26pp | R@40: +0.13pp
-- Multi-hop R@5: +1.42pp — all gain from channels A (name) and B (date)
-
-**VERDICT: v11 WINS. Lexical channels are the new champion on B DB.**
+**Single-hop is now the sole remaining bottleneck.**
 
 ---
 
 ### IMMEDIATE — Next steps:
 
-**Step 1 — Retrain GBM with 3 new lexical features:**
+**Step 1 — Diagnose single-hop failures:**
 
-Add to `reranker.py` feature extraction (bump `N_FEATURES` 18 → 21):
+Run the diagnostic to find out where the gold fact is lost for each failed single-hop question:
 ```python
-def _name_hit_count(content: str, question: str) -> int:
-    import re
-    STOPNAME = {'The', 'What', 'Who', 'When', 'Where', 'Why', 'How', 'Did', 'Does', 'Was'}
-    toks = [w for w in re.findall(r'\b[A-Z][a-z]{2,}\b', question) if w not in STOPNAME]
-    return sum(content.count(t) for t in toks)
-
-def _date_hit_count(content: str, question: str) -> int:
-    import re
-    pats = re.findall(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b|\b\d{4}\b', question)
-    return sum(content.count(p) for p in pats)
-
-def _bigram_hit_count(content: str, question: str) -> int:
-    words = [w for w in re.sub(r'[^a-z\s]', ' ', question.lower()).split() if len(w) > 2]
-    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
-    c = content.lower()
-    return sum(1 for bg in bigrams if bg in c)
+python diag_single_hop.py
 ```
-Update `reranker_metadata.json` → `{"n_features": 21}`.
-Regenerate feature cache, run `python train_reranker.py`.
-Run v12 = v11 config + retrained GBM.
+This will tag each failure as:
+- `pool_miss` — gold fact never reached top-200 pool
+- `gbm_demoted` — gold fact was in pool but GBM pushed it below position N
+- `ce_demoted` — gold fact survived GBM but CE pushed it below position N
 
-**Step 2 — Run v12 benchmark:**
-```powershell
-$env:PREFLIGHT_USE_LEXICAL_CHANNELS="1"
-python recall_ablation.py --tag v12_gbm21feat
-```
-Expect: R@3 > 80.47% if GBM learns to use channel candidates better.
+**Step 2 — Based on diagnosis, choose strategy:**
 
-**Step 3 — Port winning config to memory.py (after v12 verdict):**
-See port plan in section below.
+*If most failures are `pool_miss`:*
+- The 10 single-hop pool misses are fundamentally different from multi-hop misses
+- Likely need a dedicated single-hop channel (e.g. speaker-constrained, or noun-phrase extraction)
+- Consider: `eval_locomo.py` already has lexical channels — check if single-hop questions lack name/date tokens
 
-### MEDIUM TERM:
+*If most failures are `gbm_demoted` or `ce_demoted`:*
+- The reranker is incorrectly scoring single-hop evidence below distractors
+- Could add a GBM feature: `single_hop_candidate` signal (1 if question is single-hop type)
+- Or CE fine-tuning with single-hop pairs
 
-**GBM retraining with lexical features:**
-```python
-# In reranker.py, add to feature extraction:
-def _name_hit_count(content: str, question: str) -> int:
-    import re
-    STOPNAME = {'The', 'What', 'Who', ...}
-    toks = [w for w in re.findall(r'\b[A-Z][a-z]{2,}\b', question) if w not in STOPNAME]
-    return sum(content.count(t) for t in toks)
+*If mixed:*
+- Address pool coverage first (raises ceiling), then reranking (improves order)
 
-def _date_hit_count(content: str, question: str) -> int:
-    import re
-    pats = re.findall(r'\b(?:Jan|...|Dec)[a-z]*\s+\d{4}\b|\b\d{4}\b', question)
-    return sum(content.count(p) for p in pats)
+**Step 3 — Port winning config to memory.py:**
 
-def _bigram_hit_count(content: str, question: str) -> int:
-    words = [w for w in re.sub(r'[^a-z\s]', ' ', question.lower()).split() if len(w) > 2]
-    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
-    c = content.lower()
-    return sum(1 for bg in bigrams if bg in c)
-```
-Then update `N_FEATURES = 21` and retrain.
-
-**Port winning config to memory.py:**
-Once a champion is confirmed, replicate the pipeline in `memory.py`:
-1. Add `_USE_LEXICAL_CHANNELS` branch to `retrieve_facts()`
-2. Add broad pool union logic
-3. Add GBM reranker call
-4. Add CE reranker call (already partially done in utils.py)
-5. Add coverage guards
+After single-hop diagnosis is done, replicate pipeline in `memory.py`:
+1. Add lexical channels (`_USE_LEXICAL_CHANNELS`) to `retrieve_facts()`
+2. Add broad pool union logic (`BROAD_POOL=200`)
+3. Add GBM reranker call (now 21 features)
+4. Add CE reranker with CE guard (alpha=0, guard enabled)
+5. Change `_RRF_K` from 60 to 15
 
 ### LONGER TERM IDEAS (not yet tested):
 
@@ -574,7 +562,7 @@ C:\Users\Sheldon Antony\.config\
 │   ├── locomo10.json                 ← source dataset
 │   ├── locomo_eval_B.db              ← benchmark DB (USE THIS ONE)
 │   ├── reranker_model.pkl            ← trained GBM
-│   ├── reranker_metadata.json        ← {"n_features": 18}
+│   ├── reranker_metadata.json        ← {"n_features": 21}
 │   ├── bge-small-engram-v3\          ← local embedding model
 │   ├── locomo_recall_v8_*.json       ← v8 champion results
 │   ├── locomo_recall_v11_*.json      ← v11 results (pending)
@@ -643,3 +631,48 @@ Elapsed: 5784.2s
 This makes sense: name/date channels help questions that reference specific entities across turns.  
 
 **VERDICT: v11 WINS. Commit: `locomo_recall_v8_bdb_control.json` staged.**
+
+---
+
+## v12 Results (B DB — retrained GBM 21 features)
+
+```
+R@1:  64.21%
+R@3:  80.99%   ← +0.52pp vs v11
+R@5:  86.68%
+R@10: 91.25%
+R@40: 96.34%
+
+By category (R@5):
+  Single-hop:  56.18%  (unchanged)
+  Multi-hop:   84.70%  (+1.43pp vs v11)
+  Temporal:    85.62%  (+0.62pp vs v11)
+  Open-domain: 90.96%  (+0.23pp vs v11)
+
+Elapsed: 55202.2s
+Decision: **NEW CHAMPION** — retrained GBM learned to use lexical channel signals.
+```
+
+## Head-to-Head Comparison (B DB)
+
+| Metric | v11_lexical_channels | v12_gbm21feat | Delta |
+|--------|---------------------|---------------|-------|
+| **R@3** | 80.47% | **80.99%** | **+0.52** |
+| R@5 | 86.15% | 86.68% | +0.53 |
+| R@10 | 90.33% | 91.25% | +0.92 |
+| **R@40** | 95.75% | **96.34%** | **+0.59** |
+| Multi-hop R@5 | 83.27% | **84.70%** | **+1.43** |
+| Temporal R@5 | 85.00% | 85.62% | +0.62 |
+| Open-domain R@5 | 90.73% | 90.96% | +0.23 |
+| Single-hop R@5 | 56.18% | 56.18% | 0.00 |
+
+**All gains from GBM better utilizing lexical channel candidates. Single-hop remains the sole remaining weak category (56.18% R@5 across ALL versions). This is the last frontier for reaching 84%+ R@3.**
+
+## Files committed this session:
+- `reranker.py` — 18→21 features, lexical feature helpers, `question` param
+- `train_reranker.py` — passes `question` to `extract_features()`
+- `eval_locomo.py` — passes `question` in `_apply_learned_rerank()` call
+- `reranker_model.pkl` — retrained (21 features)
+- `reranker_scaler.pkl` — retrained
+- `reranker_metadata.json` — updated to `n_features: 21`
+- `locomo_recall_v12_gbm21feat.json` — v12 benchmark results**

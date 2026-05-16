@@ -49,12 +49,16 @@ FEATURE_NAMES: list[str] = [
     "rrf_bm25_derived_sum", # cos_rank_norm + bm25_rank_norm + derived_rank_norm (smaller=better)
     "is_temporal",          # 1 if temporal question (category==3)
     "is_multihop",          # 1 if multi-hop question (category==2)
-    # NEW v2: content-based + question-type inference features
+    # v2: content-based + question-type inference features
     "token_overlap",        # fraction of q-tokens found in fact [curr] text
     "speaker_in_q",         # 1 if speaker name appears in question text
     "n_signals",            # # retrieval signals that found this fact (0-3)
     "is_temporal_q",        # 1 if question has temporal keywords (inferred, no gold label)
     "is_multihop_q",        # 1 if question has multi-hop indicators (inferred)
+    # v3: lexical explicit-memory channel features
+    "name_token_hit_count", # name tokens from Q found in fact content
+    "date_token_hit_count", # date/year tokens from Q found in fact content
+    "bigram_hit_count",     # Q bigrams found in fact content
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
@@ -70,6 +74,46 @@ _MULTIHOP_Q_WORDS = frozenset({
 })
 _WS_RE = _re_feat.compile(r'\w+')
 
+# ── Lexical hit-count helpers (v3 features) ──────────────────────────────────
+_STOPNAME = frozenset({
+    'The', 'What', 'Who', 'When', 'Where', 'Why', 'How',
+    'Did', 'Does', 'Was', 'Were', 'Will', 'Would', 'Could', 'Should',
+})
+_MONTH_WORDS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+_DATE_RE = _re_feat.compile(r'\b' + _MONTH_WORDS + r'\s+\d{4}\b')
+_YEAR_RE = _re_feat.compile(r'\b\d{4}\b')
+
+
+def _get_lexical_question_features(question: str) -> tuple[list[str], list[str], list[str]]:
+    """Extract name tokens, date/year tokens, and bigrams from question text."""
+    # Name tokens: capitalized words not in STOPNAME
+    name_toks = [w for w in _re_feat.findall(r'\b[A-Z][a-z]{2,}\b', question)
+                 if w not in _STOPNAME]
+    # Date/year tokens
+    date_toks = list({m.group().lower() for m in _DATE_RE.finditer(question)})
+    year_toks = list({m.group() for m in _YEAR_RE.finditer(question)
+                      if not date_toks or m.group() not in date_toks[0]})
+    # Bigrams: adjacent non-stopword pairs
+    words = [w.lower() for w in _WS_RE.findall(question) if len(w) > 2]
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+    return name_toks, date_toks + year_toks, bigrams
+
+
+def _name_hit_count(fact_content: str, name_toks: list[str]) -> int:
+    return sum(fact_content.count(t) for t in name_toks)
+
+
+def _date_hit_count(fact_content: str, date_toks: list[str]) -> int:
+    c = fact_content.lower()
+    return sum(c.count(d) for d in date_toks)
+
+
+def _bigram_hit_count(fact_content: str, bigrams: list[str]) -> int:
+    if not bigrams:
+        return 0
+    c = fact_content.lower()
+    return sum(1 for bg in bigrams if bg in c)
+
 
 def extract_features(
     pool_fids:       list[int],
@@ -83,6 +127,7 @@ def extract_features(
     category:        int,                # 1=single_hop 2=multi_hop 3=temporal 4=open_domain
     question_tokens: frozenset = frozenset(),  # pre-tokenized lowercased question words
     content_by_fid:  dict | None = None,       # fid -> full content string (for overlap)
+    question:        str = "",                 # raw question text for lexical feature extraction
 ) -> np.ndarray:
     """Return feature matrix of shape (len(pool_fids), N_FEATURES)."""
     pool_size = max(len(pool_fids), 1)
@@ -95,6 +140,9 @@ def extract_features(
     # Question-type inference (same for every fid in this pool call)
     is_temporal_q = 1.0 if question_tokens & _TEMPORAL_Q_WORDS else 0.0
     is_multihop_q = 1.0 if question_tokens & _MULTIHOP_Q_WORDS else 0.0
+
+    # Pre-compute lexical question features (v3)
+    _name_toks, _date_toks, _bigrams = _get_lexical_question_features(question)
 
     rows = []
     for fid in pool_fids:
@@ -140,6 +188,11 @@ def extract_features(
         # Signal agreement count: bm25 found + derived found + cos in top-25% of n_facts
         n_sigs = bm25_found + derived_found + (1.0 if cos_rank_n < 0.25 else 0.0)
 
+        # v3 lexical features
+        _nh = _name_hit_count(content, _name_toks)
+        _dh = _date_hit_count(content, _date_toks)
+        _bh = _bigram_hit_count(content, _bigrams)
+
         rows.append([
             rrf_score, rrf_rank_n, cos_score, cos_rank_n,
             bm25_rank_n, bm25_found, derived_rank_n, derived_found,
@@ -147,6 +200,8 @@ def extract_features(
             is_temporal, is_multihop,
             # v2 features
             tok_overlap, spk_in_q, n_sigs, is_temporal_q, is_multihop_q,
+            # v3 features
+            _nh, _dh, _bh,
         ])
     return np.array(rows, dtype=np.float32)
 

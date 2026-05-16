@@ -1026,6 +1026,7 @@ def _apply_learned_rerank(
         category       = category,
         question_tokens= _q_tokens,
         content_by_fid = _content_pool,
+        question       = question,
     )
     reranked = _rr.rerank_pool(
         pool, feat, model, scaler,

@@ -326,6 +326,7 @@ def collect_features_for_conversation(
             category       = qa["category"],
             question_tokens= q_tokens,
             content_by_fid = content_by_fid_q,
+            question       = qa["question"],
         )
         y = [1 if fid in gold_fids else 0 for fid in pool]
         examples.append({
