@@ -59,6 +59,9 @@ FEATURE_NAMES: list[str] = [
     "name_token_hit_count", # name tokens from Q found in fact content
     "date_token_hit_count", # date/year tokens from Q found in fact content
     "bigram_hit_count",     # Q bigrams found in fact content
+    # v4: complete question-type features (one-hot for all 4 categories)
+    "is_single_hop",        # 1 if single-hop question (gold category==1)
+    "is_open_domain",       # 1 if open-domain question (gold category==4)
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
@@ -159,6 +162,8 @@ def extract_features(
         rank_sum       = cos_rank_n + bm25_rank_n + derived_rank_n
         is_temporal    = 1.0 if category == 3 else 0.0
         is_multihop    = 1.0 if category == 2 else 0.0
+        is_single_hop  = 1.0 if category == 1 else 0.0
+        is_open_domain = 1.0 if category == 4 else 0.0
 
         # ── Content-based features (v2) ─────────────────────────────────────────
         content = (content_by_fid or {}).get(fid, "")
@@ -202,6 +207,8 @@ def extract_features(
             tok_overlap, spk_in_q, n_sigs, is_temporal_q, is_multihop_q,
             # v3 features
             _nh, _dh, _bh,
+            # v4 features
+            is_single_hop, is_open_domain,
         ])
     return np.array(rows, dtype=np.float32)
 

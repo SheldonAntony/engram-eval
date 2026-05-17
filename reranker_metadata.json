@@ -28,14 +28,16 @@
     "is_multihop_q",
     "name_token_hit_count",
     "date_token_hit_count",
-    "bigram_hit_count"
+    "bigram_hit_count",
+    "is_single_hop",
+    "is_open_domain"
   ],
-  "n_features": 21,
+  "n_features": 23,
   "loocv_avg": {
-    "1": 49.95,
-    "3": 69.22,
-    "5": 75.68,
-    "10": 83.85,
-    "40": 93.42
+    "1": 50.91,
+    "3": 70.27,
+    "5": 76.35,
+    "10": 84.29,
+    "40": 93.96
   }
 }

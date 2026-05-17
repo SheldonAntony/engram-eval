@@ -1,9 +1,10 @@
 # LoCoMo Retrieval — Complete Handover Document
 
-> **Date:** 2026-05-16  
+> **Date:** 2026-05-17  
 > **Goal:** Maximize Recall@3 on the LoCoMo benchmark (1,531 scorable QA pairs across 10 conversations).  
 > **Current champion:** v12 — retrained GBM (21 feat) — **R@3 = 80.99%, R@40 = 96.34% (B DB)**  
 > **Previous champion:** v11 — lexical channels — R@3 = 80.47%, R@40 = 95.75% (B DB)  
+> **Active run:** v13 — question-type GBM features (23 feat) + alpha=2.0 — **PENDING** (ETA ~15:00 UTC)  
 > **Stretch target:** R@3 ≥ 84%
 
 ---
@@ -437,12 +438,11 @@ The 10th conversation is the largest. If the benchmark crashes with OOM on Conv 
 - Needs port AFTER a winning config is confirmed
 - Do NOT port until v11 results are analyzed
 
-### `reranker.py` — MODIFIED (v12)
-- Added 3 lexical features: `name_token_hit_count`, `date_token_hit_count`, `bigram_hit_count`
-- `N_FEATURES = 21` version guard on load
-- Added `_get_lexical_question_features()` helper + `_name_hit_count/_date_hit_count/_bigram_hit_count`
-- `extract_features()` now accepts `question: str = ""` parameter for raw question text
-- `FEATURE_NAMES` updated from 18 → 21 entries
+### `reranker.py` — MODIFIED (v13)
+- v12: Added 3 lexical features (18→21): `name_token_hit_count`, `date_token_hit_count`, `bigram_hit_count`
+- v12: Added `_get_lexical_question_features()` helper, `question` param, updated `FEATURE_NAMES`
+- v13: Added `is_single_hop` and `is_open_domain` features (21→23) for complete question-type one-hot encoding
+- `N_FEATURES = 23` version guard on load
 
 ---
 
@@ -459,42 +459,19 @@ v12 (retrained GBM with 21 features) beats v11 across all metrics:
 
 ---
 
-### IMMEDIATE — Next steps:
+### ✅ v13 RUNNING — question-type GBM features + alpha=2.0
 
-**Step 1 — Diagnose single-hop failures:**
+**Changes in v13:**
+- Added `is_single_hop` and `is_open_domain` GBM features (21→23 features)
+- Reduced GBM alpha from 3.0 to 2.0 (softer rerank, RRF dominates more)
+- GBM retrained with 23 features via `train_reranker.py`
+- Running fully on WSL native FS (no /mnt/c/ overhead) for ~2x speedup
+- Started: 07:13 UTC, ETA: ~15:00 UTC
+- Result: `locomo_recall_v13_gbm23feat_alpha2.json` (pending)
 
-Run the diagnostic to find out where the gold fact is lost for each failed single-hop question:
-```python
-python diag_single_hop.py
-```
-This will tag each failure as:
-- `pool_miss` — gold fact never reached top-200 pool
-- `gbm_demoted` — gold fact was in pool but GBM pushed it below position N
-- `ce_demoted` — gold fact survived GBM but CE pushed it below position N
-
-**Step 2 — Based on diagnosis, choose strategy:**
-
-*If most failures are `pool_miss`:*
-- The 10 single-hop pool misses are fundamentally different from multi-hop misses
-- Likely need a dedicated single-hop channel (e.g. speaker-constrained, or noun-phrase extraction)
-- Consider: `eval_locomo.py` already has lexical channels — check if single-hop questions lack name/date tokens
-
-*If most failures are `gbm_demoted` or `ce_demoted`:*
-- The reranker is incorrectly scoring single-hop evidence below distractors
-- Could add a GBM feature: `single_hop_candidate` signal (1 if question is single-hop type)
-- Or CE fine-tuning with single-hop pairs
-
-*If mixed:*
-- Address pool coverage first (raises ceiling), then reranking (improves order)
-
-**Step 3 — Port winning config to memory.py:**
-
-After single-hop diagnosis is done, replicate pipeline in `memory.py`:
-1. Add lexical channels (`_USE_LEXICAL_CHANNELS`) to `retrieve_facts()`
-2. Add broad pool union logic (`BROAD_POOL=200`)
-3. Add GBM reranker call (now 21 features)
-4. Add CE reranker with CE guard (alpha=0, guard enabled)
-5. Change `_RRF_K` from 60 to 15
+**Expected impact:** +1-2pp R@3 by fixing close rerank failures (87 questions at rank 4-5) through:
+1. GBM learning per-category patterns (single-hop → trust cosine more)
+2. Lower alpha preserving more RRF order, preventing GBM from demoting close-call items
 
 ### LONGER TERM IDEAS (not yet tested):
 
