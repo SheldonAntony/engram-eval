@@ -30,9 +30,10 @@
     "date_token_hit_count",
     "bigram_hit_count",
     "is_single_hop",
-    "is_open_domain"
+    "is_open_domain",
+    "turn_position_norm"
   ],
-  "n_features": 23,
+  "n_features": 24,
   "loocv_avg": {
     "1": 50.91,
     "3": 70.27,

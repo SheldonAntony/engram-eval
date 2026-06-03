@@ -56,7 +56,11 @@ _USE_BM25_STOPWORDS     = os.environ.get("PREFLIGHT_USE_STOPWORDS",    "0") == "
 _BM25_RRF_WEIGHT        = float(os.environ.get("PREFLIGHT_BM25_WEIGHT", "1.0"))
 _USE_CE_IN_RECALL_EVAL  = os.environ.get("PREFLIGHT_USE_CE",            "0") == "1"
 _USE_EVAL_SPEAKER_BOOST = os.environ.get("PREFLIGHT_SPEAKER_BOOST",    "0") == "1"
-_RRF_K                  = int(os.environ.get("PREFLIGHT_RRF_K",         "60"))
+# Per-signal RRF_K: both default to 15 (sweet spot per v3 sweep; K=15 was best).
+# Override via PREFLIGHT_RRF_K_COS and PREFLIGHT_RRF_K_BM25 env vars.
+_RRF_K_COS  = int(os.environ.get("PREFLIGHT_RRF_K_COS",  "15"))
+_RRF_K_BM25 = int(os.environ.get("PREFLIGHT_RRF_K_BM25", "15"))
+_RRF_K      = _RRF_K_COS  # legacy compat — not used in per-signal code path
 _USE_DERIVED_BM25       = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
 _POOL_A_SIZE            = int(os.environ.get("PREFLIGHT_POOL_A",        "750"))
 _USE_LLM_ATOMIC_RERANK  = os.environ.get("PREFLIGHT_USE_LLM_ATOMIC_RERANK", "0") == "1"
@@ -93,6 +97,12 @@ _BROAD_POOL         = int(os.environ.get("PREFLIGHT_BROAD_POOL", "0"))
 #   C) Key-bigram:  facts containing important adjacent word pairs from the question.
 # These channels target the ~37 true pool misses where cosine+BM25 both fail.
 _USE_LEXICAL_CHANNELS = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "0") == "1"
+_USE_CONTEXT_BM25 = os.environ.get("PREFLIGHT_USE_CONTEXT_BM25", "0") == "1"
+
+# Adjacent-turn expansion: for every fact retrieved by lexical channels (name,
+# date, bigram), also include its immediate neighbours (fid-1, fid+1).  This
+# helps multi-hop questions where evidence is near a known entity mention.
+_USE_ADJACENT_EXPANSION = os.environ.get("PREFLIGHT_ADJACENT_EXPANSION", "0") == "1"
 
 # Coverage protection: after reranking, apply min-rank ensemble of reranker
 # and RRF orderings so R@K cannot fall below the RRF baseline.
@@ -953,6 +963,7 @@ def _apply_learned_rerank(
     alpha: float = 0.0,
     question: str = "",
     content_by_fid: dict | None = None,
+    fid_bounds: tuple[int, int] | None = None,
 ) -> list:
     """Rerank the top-pool_size candidates using the trained feature model."""
     import hashlib as _hl                # noqa: PLC0415
@@ -1027,6 +1038,7 @@ def _apply_learned_rerank(
         question_tokens= _q_tokens,
         content_by_fid = _content_pool,
         question       = question,
+        fid_bounds     = fid_bounds,
     )
     reranked = _rr.rerank_pool(
         pool, feat, model, scaler,
@@ -1156,6 +1168,64 @@ def _atomic_rerank(
     return sorted(top_fids, key=combined.__getitem__, reverse=True)
 
 
+def _setup_context_fts(conn: sqlite3.Connection) -> None:
+    # 1. Create the virtual table if not exists
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS facts_context_fts USING fts5(content)")
+    
+    # 2. Check if it's already populated (has rows)
+    existing_count = conn.execute("SELECT COUNT(*) FROM facts_context_fts").fetchone()[0]
+    if existing_count > 0:
+        return
+        
+    print("  [context-fts] Building dialogue-context FTS5 index...")
+    # 3. Retrieve all window facts
+    rows = conn.execute(
+        "SELECT id, project_id, content FROM facts WHERE fact_type != 'turn' AND superseded_at IS NULL"
+    ).fetchall()
+    
+    # Map project_id -> list of (fid, content) sorted by fid
+    project_facts = {}
+    for fid, pid, content in rows:
+        project_facts.setdefault(pid, []).append((fid, content))
+        
+    for pid, facts_list in project_facts.items():
+        facts_list.sort(key=lambda x: x[0])
+        # Build fid -> curr_text map
+        fid_to_curr = {}
+        for fid, content in facts_list:
+            # Extract curr text
+            curr_text = ""
+            for line in content.split("\n"):
+                if line.startswith("[curr] "):
+                    curr_text = line[len("[curr] "):]
+                    break
+            fid_to_curr[fid] = curr_text
+            
+        # For each fact, build context of ±2 turns
+        # Context is: curr(fid-2) + curr(fid-1) + curr(fid) + curr(fid+1) + curr(fid+2)
+        # But wait! We should only use turns within the same conversation (same pid)
+        # So we can look up neighboring fids in the facts_list (since they are sorted)
+        fid_to_index = {fid: idx for idx, (fid, _) in enumerate(facts_list)}
+        
+        insert_data = []
+        for fid, _ in facts_list:
+            idx = fid_to_index[fid]
+            # Context window indices: idx-2 to idx+2
+            context_turns = []
+            for i in range(max(0, idx - 2), min(len(facts_list), idx + 3)):
+                neighbor_fid = facts_list[i][0]
+                context_turns.append(fid_to_curr[neighbor_fid])
+            context_text = " ".join(context_turns)
+            insert_data.append((fid, context_text))
+            
+        conn.executemany(
+            "INSERT INTO facts_context_fts(rowid, content) VALUES(?, ?)",
+            insert_data
+        )
+    conn.commit()
+    print(f"  [context-fts] Built dialogue-context index successfully.")
+
+
 # ── Recall@K evaluation ───────────────────────────────────────────────────────
 
 def run_recall_eval(samples: list, db_path: str) -> dict:
@@ -1183,6 +1253,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
     per_q: list[dict] = []
     t0   = time.time()
     conn = sqlite3.connect(db_path)
+    _setup_context_fts(conn)
 
     for si, sample in enumerate(samples):
         sid_str = str(sample.get("sample_id", 0))
@@ -1269,13 +1340,37 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                                     bm_rank += 1
                 except Exception:
                     pass
-                # RRF merge: cosine + BM25 (derived BM25 env-gated via PREFLIGHT_USE_DERIVED_BM25)
+
+                # Dialogue-context BM25 ranking via FTS5 facts_context_fts
+                context_bm25_rank_eval: dict[int, int] = {}
+                try:
+                    if _USE_CONTEXT_BM25 and tokens:
+                        fts_q = " OR ".join(f'"{t}"' for t in tokens)
+                        if fids_in_cache:
+                            fids_set = set(fids_in_cache)
+                            ctx_rows = conn.execute(
+                                "SELECT rowid FROM facts_context_fts WHERE facts_context_fts MATCH ? ORDER BY bm25(facts_context_fts)",
+                                (fts_q,),
+                            ).fetchall()
+                            ctx_rank = 0
+                            for (cfid,) in ctx_rows:
+                                if cfid in fids_set:
+                                    context_bm25_rank_eval[cfid] = ctx_rank
+                                    ctx_rank += 1
+                except Exception:
+                    pass
+
+                # RRF merge: per-signal K values — cosine uses tighter K (rank
+                # dominates), BM25 uses looser K (avoids over-penalising sparse
+                # token matches).  Override via PREFLIGHT_RRF_K_COS / _BM25.
                 n_facts = len(fact_cache)
                 rrf_scores: dict[int, float] = {}
                 for fid, _, _ in fact_cache:
-                    s  = 1.0 / (_RRF_K + cos_rank.get(fid, n_facts))
+                    s  = 1.0 / (_RRF_K_COS + cos_rank.get(fid, n_facts))
                     if fid in bm25_rank_eval:
-                        s += _BM25_RRF_WEIGHT / (_RRF_K + bm25_rank_eval[fid])
+                        s += _BM25_RRF_WEIGHT / (_RRF_K_BM25 + bm25_rank_eval[fid])
+                    if _USE_CONTEXT_BM25 and fid in context_bm25_rank_eval:
+                        s += _BM25_RRF_WEIGHT / (_RRF_K_BM25 + context_bm25_rank_eval[fid])
                     rrf_scores[fid] = s
                 if _USE_DERIVED_BM25:
                     derived_rank_eval: dict[int, int] = {}
@@ -1316,6 +1411,9 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                     _cos_order  = sorted(fids_in_cache, key=lambda f: cos_rank.get(f, n_facts))
                     _bm25_order = sorted(fids_in_cache, key=lambda f: bm25_rank_eval.get(f, n_facts))
                     _broad_parts = _cos_order[:_BROAD_POOL] + _bm25_order[:_BROAD_POOL]
+                    if _USE_CONTEXT_BM25:
+                        _context_order = sorted(fids_in_cache, key=lambda f: context_bm25_rank_eval.get(f, n_facts))
+                        _broad_parts += _context_order[:_BROAD_POOL]
                     if _USE_DERIVED_BM25:
                         _broad_parts += sorted(
                             fids_in_cache, key=lambda f: derived_rank_eval.get(f, n_facts)
@@ -1352,19 +1450,46 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                                 if _s:
                                     _date_sc[_fid] = _s
                             _broad_parts += sorted(_date_sc, key=_date_sc.__getitem__, reverse=True)[:_BROAD_POOL]
-                        # Channel C: key-bigram — facts containing important adjacent word pairs
+                        # Channel C: key-bigram — facts containing important adjacent word pairs.
+                        # Uses FTS5 PHRASE (correct token-boundary matching) with substring
+                        # fallback if the FTS5 query fails.
                         _q_words_lx = [w for w in _re_lx.sub(r'[^a-z\s]', ' ', qa["question"].lower()).split()
                                        if len(w) > 2 and w not in _BM25_STOPWORDS]
                         if len(_q_words_lx) >= 2:
                             _bigrams_lx = [f"{_q_words_lx[i]} {_q_words_lx[i+1]}"
                                            for i in range(len(_q_words_lx) - 1)]
                             _bgram_hits: list[int] = []
-                            for _fid in fids_in_cache:
-                                _c = content_by_fid_ev.get(_fid, "").lower()
-                                if any(_bg in _c for _bg in _bigrams_lx):
-                                    _bgram_hits.append(_fid)
+                            try:
+                                _phrase_q = " OR ".join(f'"{bg}"' for bg in _bigrams_lx)
+                                _br_rows = conn.execute(
+                                    "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ?",
+                                    (_phrase_q,),
+                                ).fetchall()
+                                _fids_set_b = set(fids_in_cache)
+                                for (_bfid,) in _br_rows:
+                                    if _bfid in _fids_set_b:
+                                        _bgram_hits.append(_bfid)
+                            except Exception:
+                                _bgram_hits = []
+                            if not _bgram_hits:
+                                for _fid in fids_in_cache:
+                                    _c = content_by_fid_ev.get(_fid, "").lower()
+                                    if any(_bg in _c for _bg in _bigrams_lx):
+                                        _bgram_hits.append(_fid)
                             _broad_parts += _bgram_hits[:_BROAD_POOL]
                     _broad_cands = list(dict.fromkeys(_broad_parts))
+                    # Adjacent-turn expansion: add immediate neighbours of every
+                    # broad-pool candidate to help multi-hop questions that need
+                    # evidence from nearby turns.  Only adds fids that exist in
+                    # the current conversation's fact cache.
+                    if _USE_ADJACENT_EXPANSION:
+                        _adj_set = set(_broad_cands)
+                        for _fid in _broad_cands:
+                            if _fid - 1 in fids_in_cache:
+                                _adj_set.add(_fid - 1)
+                            if _fid + 1 in fids_in_cache:
+                                _adj_set.add(_fid + 1)
+                        _broad_cands = list(_adj_set)
                     _broad_set   = set(_broad_cands)
                     _broad_sorted = sorted(_broad_cands, key=lambda f: rrf_scores.get(f, 0.0), reverse=True)
                     _tail_sorted  = sorted(
@@ -1395,6 +1520,9 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                 # Learned feature reranker: combines cos/BM25/derived/atomic signals
                 # using a pre-trained GBM. Run train_reranker.py first.
                 if _USE_LEARNED_RERANK and sorted_ids:
+                    _fids_all = {fid for fid, _, _ in fact_cache}
+                    _fid_min = min(_fids_all) if _fids_all else 0
+                    _fid_max = max(_fids_all) if _fids_all else 1
                     sorted_ids = _apply_learned_rerank(
                         conn           = conn,
                         pid            = pid,
@@ -1413,6 +1541,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                         alpha          = _LEARNED_RERANK_ALPHA,
                         question       = qa["question"],
                         content_by_fid = content_by_fid_ev,
+                        fid_bounds     = (_fid_min, _fid_max),
                     )
                     # ── Coverage protection (Phase 3) ───────────────────────────────
                     # Min-rank ensemble: final rank = min(reranker_rank, rrf_rank).
@@ -1676,6 +1805,118 @@ def main() -> None:
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(full_results, f, indent=2)
     print(f"\nFull results saved -> {RESULTS_PATH}")
+
+
+# ── Production code path evaluation (PREFLIGHT_RETRIEVE_BENCHMARK) ────────────
+
+def run_production_recall_eval(samples, db_path):
+    """Measure Recall@K using production memory.retrieve_facts() directly.
+
+    Same interface as run_recall_eval() but calls memory.retrieve_facts()
+    for each question, testing the actual production code path with broad pool,
+    lexical channels, CE guard, coverage guard, etc.
+    """
+    import memory as _mem  # noqa: PLC0415
+    _mem.DB_PATH = db_path
+    _mem._CACHE_DIRTY.clear()
+    _mem._EMB_CACHE.clear()
+
+    print(f"\n{'='*60}")
+    print(f"  PRODUCTION RECALL@K EVALUATION")
+    print(f"  DB: {db_path}")
+    print(f"{'='*60}")
+
+    print("\nBuilding dia_id map...", flush=True)
+    t0 = time.time()
+    dia_id_map = build_dia_id_map(samples, db_path)
+    print(f"  Done in {time.time() - t0:.1f}s")
+
+    print("\nScoring Recall@K via memory.retrieve_facts()...", flush=True)
+    per_q: list[dict] = []
+    t0 = time.time()
+
+    recall_hits: dict[int, int] = {k: 0 for k in _RECALL_KS}
+    total_ev = 0
+    total_qa_all = 0
+
+    for si, sample in enumerate(samples):
+        sid_str = str(sample.get("sample_id", 0))
+        pid = f"locomo_{sid_str}"
+        pid_map = dia_id_map.get(pid, {})
+        _mem._CACHE_DIRTY.add(pid)
+        if pid in _mem._EMB_CACHE:
+            del _mem._EMB_CACHE[pid]
+
+        qa_list = list(iter_qa(sample))
+        n_pid_questions = 0
+        n_pid_ev = 0
+        for qa in qa_list:
+            total_qa_all += 1
+            evidence = qa.get("evidence", [])
+            evidence_fact_ids: set = set()
+            for d in evidence:
+                fids = pid_map.get(d)
+                if fids:
+                    evidence_fact_ids.update(fids)
+            has_evidence = bool(evidence) and bool(evidence_fact_ids)
+            if not has_evidence:
+                continue
+            total_ev += 1
+            n_pid_ev += 1
+
+            q_text = qa["question"]
+            result = _mem.retrieve_facts(
+                pid, "", q_text,
+                top_n=40, threshold=0.0,
+                include_budget_info=True,
+            )
+            ranked_fids: list[int] = result.get("all_ranked_fids", [])
+
+            for k in _RECALL_KS:
+                topk = ranked_fids[:k]
+                if evidence_fact_ids & set(topk):
+                    recall_hits[k] += 1
+
+            q_rec = {}
+            for k in _RECALL_KS:
+                topk = ranked_fids[:k]
+                q_rec[k] = bool(evidence_fact_ids & set(topk))
+            per_q.append({
+                "question": q_text,
+                "evidence_dia_ids": evidence,
+                "evidence_fact_ids": list(evidence_fact_ids),
+                "retrieved_top5_fids": ranked_fids[:5],
+                "recall": q_rec,
+            })
+
+        n_pid_questions = len(qa_list)
+        print(f"  Conv {si+1}/{len(samples)}: {n_pid_questions} questions, "
+              f"{n_pid_ev} with evidence  "
+              f"(R@5 so far: {recall_hits[5]/max(total_ev,1)*100:.1f}%)", flush=True)
+
+    elapsed = time.time() - t0
+    recall_scores = {}
+    for k in _RECALL_KS:
+        recall_scores[k] = recall_hits[k] / max(total_ev, 1)
+
+    result = {
+        "questions_with_evidence": total_ev,
+        "questions_total": total_qa_all,
+        "recall_at_k": {str(k): round(v * 100, 2) for k, v in recall_scores.items()},
+        "per_question": per_q,
+    }
+
+    out_path = RECALL_RESULTS_PATH
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    print(f"\nElapsed: {elapsed:.1f}s")
+    print(f"Results -> {out_path}")
+    print(f"\n{'Metric':<8} {'Recall':>10}")
+    print("-" * 25)
+    for k in _RECALL_KS:
+        pct = recall_scores[k] * 100
+        print(f"  R@{k:<4} {pct:>10.2f}%")
+    return result
 
 
 if __name__ == "__main__":

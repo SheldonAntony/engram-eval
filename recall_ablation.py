@@ -35,6 +35,10 @@ _SCRIPTS_DIR   = os.path.join(os.path.expanduser("~"), ".config", "opencode")
 sys.path.insert(0, _SCRIPTS_DIR)
 sys.path.insert(0, _PREFLIGHT_DIR)
 
+# Production benchmark mode: calls memory.retrieve_facts() directly.
+# Must be set BEFORE importing eval_locomo (which imports memory).
+_PRODUCTION_BENCHMARK = os.environ.get("PREFLIGHT_RETRIEVE_BENCHMARK", "0") == "1"
+
 DATA_CACHE = os.path.join(_PREFLIGHT_DIR, "locomo10.json")
 
 # Known-good baseline for comparison
@@ -69,6 +73,8 @@ _ap  = os.environ.get("PREFLIGHT_LLM_ATOMIC_POOL",        "40")
 
 if args.tag:
     tag = args.tag
+elif _PRODUCTION_BENCHMARK:
+    tag = "production_benchmark"
 else:
     tag = f"sw{_sw}_bm{_bw.replace('.','p')}_ce{_ce}_sp{_sp}_llm{_llm}_k{_rk}"
 
@@ -101,6 +107,7 @@ _em = os.environ.get("ENGRAM_EMBED_MODEL", "(default)")
 print(f"  Embed backend          : {_eb}")
 print(f"  Embed model            : {_em}")
 print(f"  Reingest               : {args.reingest}")
+print(f"  Production code path   : {_PRODUCTION_BENCHMARK}")
 print(f"  DB path                : {DB_PATH}")
 print(f"  DB exists              : {os.path.exists(DB_PATH)}")
 print()
@@ -143,12 +150,17 @@ elif not os.path.exists(DB_PATH):
 
 # ── Run recall eval ────────────────────────────────────────────────────────────
 t0 = time.time()
-result = ev.run_recall_eval(samples, DB_PATH)
+if _PRODUCTION_BENCHMARK:
+    print("\nUsing production retrieval code path (memory.retrieve_facts)...")
+    result = ev.run_production_recall_eval(samples, DB_PATH)
+else:
+    result = ev.run_recall_eval(samples, DB_PATH)
 elapsed = time.time() - t0
 
 # ── Save tagged results ────────────────────────────────────────────────────────
 result["_ablation"] = {
     "tag": tag,
+    "production_code_path":      _PRODUCTION_BENCHMARK,
     "USE_BM25_STOPWORDS":        ev._USE_BM25_STOPWORDS,
     "BM25_RRF_WEIGHT":           ev._BM25_RRF_WEIGHT,
     "USE_CE_IN_RECALL_EVAL":     ev._USE_CE_IN_RECALL_EVAL,

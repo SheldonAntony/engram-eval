@@ -29,6 +29,11 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
+try:
+    import ijson
+except ImportError:
+    ijson = None  # fallback: will error later for large files
+
 # ── Add opencode scripts dir so memory.py / utils.py / extractor.py load ──────
 # Derive from __file__ so this works both on Windows native and under WSL
 # (where Path.home() points to the Linux home, not the Windows one).
@@ -105,22 +110,45 @@ def main() -> None:
                         help="Dataset split (default: oracle)")
     args = parser.parse_args()
 
-    # ── Load dataset ──────────────────────────────────────────────────────────
+    # ── Load dataset (stream large files with ijson) ──────────────────────────
     data_path = _download(args.split)
-    instances: list = json.loads(data_path.read_text(encoding="utf-8"))
-    print(f"Loaded {len(instances)} instances from {args.split} split.")
+    is_large = data_path.stat().st_size > 200_000_000  # >200MB → stream
 
-    # Skip abstention instances — they have no ground-truth evidence sessions.
-    non_abs = [
-        inst for inst in instances
-        if not inst["question_id"].endswith("_abs")
-        and inst.get("answer_session_ids")
-    ]
-    print(f"  Non-abstention instances with answers: {len(non_abs)}")
+    if is_large and ijson is None:
+        print("ERROR: --split m requires ijson. Install it:")
+        print("  ~/.config/opencode/.venv/bin/python -m pip install ijson")
+        sys.exit(1)
 
-    if args.limit:
-        non_abs = non_abs[: args.limit]
-        print(f"  Limited to first {args.limit}.")
+    if is_large:
+        print(f"Streaming instances from {args.split} split (large file)...")
+        f = open(data_path, "rb")
+        all_instances = ijson.items(f, "item")
+        # Count and collect non-abstention instances (with limit)
+        non_abs: list[dict] = []
+        total_seen = 0
+        for inst in all_instances:
+            total_seen += 1
+            if (not inst["question_id"].endswith("_abs")
+                    and inst.get("answer_session_ids")):
+                non_abs.append(inst)
+                if args.limit and len(non_abs) >= args.limit:
+                    break
+        print(f"  Scanned {total_seen} instances, {len(non_abs)} non-abstention.")
+        if args.limit:
+            print(f"  Limited to first {args.limit}.")
+        f.close()
+    else:
+        instances: list = json.loads(data_path.read_text(encoding="utf-8"))
+        print(f"Loaded {len(instances)} instances from {args.split} split.")
+        non_abs = [
+            inst for inst in instances
+            if not inst["question_id"].endswith("_abs")
+            and inst.get("answer_session_ids")
+        ]
+        print(f"  Non-abstention instances with answers: {len(non_abs)}")
+        if args.limit:
+            non_abs = non_abs[: args.limit]
+            print(f"  Limited to first {args.limit}.")
 
     # ── Import memory AFTER path is configured ────────────────────────────────
     import memory as mem  # noqa: PLC0415

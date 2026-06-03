@@ -62,6 +62,8 @@ FEATURE_NAMES: list[str] = [
     # v4: complete question-type features (one-hot for all 4 categories)
     "is_single_hop",        # 1 if single-hop question (gold category==1)
     "is_open_domain",       # 1 if open-domain question (gold category==4)
+    # v5: turn-position feature
+    "turn_position_norm",   # normalised turn index in conversation (0=first, 1=last)
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
@@ -131,6 +133,7 @@ def extract_features(
     question_tokens: frozenset = frozenset(),  # pre-tokenized lowercased question words
     content_by_fid:  dict | None = None,       # fid -> full content string (for overlap)
     question:        str = "",                 # raw question text for lexical feature extraction
+    fid_bounds:      tuple[int, int] | None = None,  # (min_fid, max_fid) for turn-position norm
 ) -> np.ndarray:
     """Return feature matrix of shape (len(pool_fids), N_FEATURES)."""
     pool_size = max(len(pool_fids), 1)
@@ -164,6 +167,11 @@ def extract_features(
         is_multihop    = 1.0 if category == 2 else 0.0
         is_single_hop  = 1.0 if category == 1 else 0.0
         is_open_domain = 1.0 if category == 4 else 0.0
+        # v5: normalised turn position within conversation (0=first, 1=last)
+        if fid_bounds is not None and fid_bounds[1] > fid_bounds[0]:
+            turn_pos_norm = (fid - fid_bounds[0]) / (fid_bounds[1] - fid_bounds[0])
+        else:
+            turn_pos_norm = 0.5
 
         # ── Content-based features (v2) ─────────────────────────────────────────
         content = (content_by_fid or {}).get(fid, "")
@@ -209,6 +217,8 @@ def extract_features(
             _nh, _dh, _bh,
             # v4 features
             is_single_hop, is_open_domain,
+            # v5 features
+            turn_pos_norm,
         ])
     return np.array(rows, dtype=np.float32)
 

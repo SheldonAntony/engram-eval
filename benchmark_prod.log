@@ -1,0 +1,44 @@
+============================================================
+  RECALL@K ABLATION
+============================================================
+  Tag                    : engram_v20_prod
+  _USE_BM25_STOPWORDS    : False
+  _BM25_RRF_WEIGHT       : 1.0
+  _USE_CE_IN_RECALL_EVAL : False
+  _USE_EVAL_SPEAKER_BOOST: False
+  _RRF_K                 : 15
+  _USE_DERIVED_BM25      : False
+  _POOL_A_SIZE           : 750
+  _USE_LLM_ATOMIC_RERANK : False
+  _LLM_ATOMIC_ALPHA      : 0.1
+  _LLM_ATOMIC_SCORE_MODE : max
+  _LLM_ATOMIC_POOL       : 40
+  LLM extractor          : False
+  LLM workers            : 4
+  store_turn             : False (benchmark mode)
+  Embed backend          : fastembed
+  Embed model            : (default)
+  Reingest               : False
+  Production code path   : True
+  DB path                : /home/sheldon_antony/.config/preflight/locomo_eval_B.db
+  DB exists              : True
+
+Loading dataset from /home/sheldon_antony/.config/preflight/locomo10.json ...
+  10 conversations loaded.
+
+
+Using production retrieval code path (memory.retrieve_facts)...
+
+============================================================
+  PRODUCTION RECALL@K EVALUATION
+  DB: /home/sheldon_antony/.config/preflight/locomo_eval_B.db
+============================================================
+
+Building dia_id map...
+  Done in 0.1s
+
+Scoring Recall@K via memory.retrieve_facts()...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/202 [00:00<?, ?it/s]Loading weights: 100%|██████████| 202/202 [00:00<00:00, 3247.93it/s]
+  Conv 1/10: 152 questions, 149 with evidence  (R@5 so far: 38.9%)
+  Conv 2/10: 81 questions, 81 with evidence  (R@5 so far: 34.8%)

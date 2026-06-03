@@ -55,7 +55,9 @@ POOL_SIZE     = args.pool
 BROAD_POOL_N  = args.broad_pool  # 0 = use RRF top-POOL_SIZE; >0 = union per-signal
 
 # ── Env flags ─────────────────────────────────────────────────────────────────
-_RRF_K            = int(os.environ.get("PREFLIGHT_RRF_K", "60"))
+_RRF_K            = int(os.environ.get("PREFLIGHT_RRF_K",           "60"))
+_RRF_K_COS        = int(os.environ.get("PREFLIGHT_RRF_K_COS",      "15"))
+_RRF_K_BM25       = int(os.environ.get("PREFLIGHT_RRF_K_BM25",     "15"))
 _BM25_RRF_WEIGHT  = float(os.environ.get("PREFLIGHT_BM25_WEIGHT", "1.0"))
 _USE_DERIVED_BM25 = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
 _INCLUDE_ATOMIC   = args.include_atomic
@@ -252,12 +254,12 @@ def collect_features_for_conversation(
         except Exception:
             pass
 
-        # ── RRF ─────────────────────────────────────────────────────────────
+        # ── RRF (per-signal K to match eval_locomo.py) ───────────────────────
         rrf_scores: dict[int, float] = {}
         for fid, _, _ in fact_cache:
-            s = 1.0 / (_RRF_K + cos_ranks.get(fid, n_facts))
+            s = 1.0 / (_RRF_K_COS + cos_ranks.get(fid, n_facts))
             if fid in bm25_ranks:
-                s += _BM25_RRF_WEIGHT / (_RRF_K + bm25_ranks[fid])
+                s += _BM25_RRF_WEIGHT / (_RRF_K_BM25 + bm25_ranks[fid])
             rrf_scores[fid] = s
 
         # ── Derived BM25 ────────────────────────────────────────────────────
@@ -314,6 +316,8 @@ def collect_features_for_conversation(
         )
 
         # ── Build feature rows ───────────────────────────────────────────────
+        _fid_min = min(fids_in_cache) if fids_in_cache else 0
+        _fid_max = max(fids_in_cache) if fids_in_cache else 1
         X = _rr.extract_features(
             pool_fids      = pool,
             rrf_scores     = rrf_scores,
@@ -327,6 +331,7 @@ def collect_features_for_conversation(
             question_tokens= q_tokens,
             content_by_fid = content_by_fid_q,
             question       = qa["question"],
+            fid_bounds     = (_fid_min, _fid_max),
         )
         y = [1 if fid in gold_fids else 0 for fid in pool]
         examples.append({
@@ -461,7 +466,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  TRAIN LEARNED RERANKER")
     print(f"  DB: {DB_PATH}")
-    print(f"  RRF_K={_RRF_K}  POOL={POOL_SIZE}  BROAD_POOL={BROAD_POOL_N}  DERIVED={_USE_DERIVED_BM25}  ATOMIC={_INCLUDE_ATOMIC}")
+    print(f"  RRF_K_COS={_RRF_K_COS}  RRF_K_BM25={_RRF_K_BM25}  POOL={POOL_SIZE}  BROAD_POOL={BROAD_POOL_N}  DERIVED={_USE_DERIVED_BM25}  ATOMIC={_INCLUDE_ATOMIC}")
     print(f"  Model type: {args.model_type}")
     print(f"{'='*60}")
 

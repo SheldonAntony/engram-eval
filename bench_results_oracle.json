@@ -298,7 +298,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "982b5123",
@@ -311,7 +311,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "b9cfe692",
@@ -363,7 +363,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "e4e14d04",
@@ -701,7 +701,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "gpt4_5438fa52",
@@ -948,7 +948,7 @@
       },
       "n_haystack": 3,
       "n_answer": 3,
-      "n_retrieved": 1
+      "n_retrieved": 3
     },
     {
       "qid": "28dc39ac",
@@ -974,7 +974,7 @@
       },
       "n_haystack": 3,
       "n_answer": 3,
-      "n_retrieved": 3
+      "n_retrieved": 1
     },
     {
       "qid": "2e6d26dc",
@@ -1026,7 +1026,7 @@
       },
       "n_haystack": 3,
       "n_answer": 3,
-      "n_retrieved": 3
+      "n_retrieved": 2
     },
     {
       "qid": "d23cf73b",
@@ -1065,7 +1065,7 @@
       },
       "n_haystack": 3,
       "n_answer": 3,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "7024f17c",
@@ -1416,7 +1416,7 @@
       },
       "n_haystack": 4,
       "n_answer": 4,
-      "n_retrieved": 4
+      "n_retrieved": 3
     },
     {
       "qid": "c2ac3c61",
@@ -1559,7 +1559,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "71315a70",
@@ -1572,7 +1572,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "89941a93",
@@ -1663,7 +1663,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "4d6b87c8",
@@ -1871,7 +1871,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "2133c1b5",
@@ -1897,7 +1897,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "db467c8c",
@@ -4393,7 +4393,7 @@
       },
       "n_haystack": 3,
       "n_answer": 3,
-      "n_retrieved": 3
+      "n_retrieved": 2
     },
     {
       "qid": "71017276",
@@ -4471,7 +4471,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "gpt4_b5700ca9",
@@ -4640,7 +4640,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 1
+      "n_retrieved": 2
     },
     {
       "qid": "gpt4_468eb063",
@@ -4848,7 +4848,7 @@
       },
       "n_haystack": 5,
       "n_answer": 5,
-      "n_retrieved": 4
+      "n_retrieved": 3
     },
     {
       "qid": "gpt4_8e165409",
@@ -5043,7 +5043,7 @@
       },
       "n_haystack": 3,
       "n_answer": 3,
-      "n_retrieved": 3
+      "n_retrieved": 1
     },
     {
       "qid": "gpt4_7bc6cf22",
@@ -5147,7 +5147,7 @@
       },
       "n_haystack": 5,
       "n_answer": 5,
-      "n_retrieved": 4
+      "n_retrieved": 3
     },
     {
       "qid": "gpt4_59149c78",
@@ -5355,7 +5355,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "a11281a2",
@@ -5459,7 +5459,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "7405e8b1",
@@ -5563,7 +5563,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "4adc0475",
@@ -5719,7 +5719,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "0100672e",
@@ -5862,7 +5862,7 @@
       },
       "n_haystack": 2,
       "n_answer": 2,
-      "n_retrieved": 2
+      "n_retrieved": 1
     },
     {
       "qid": "61f8c8f8",

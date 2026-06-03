@@ -23931,5 +23931,23 @@
       "hit@10": true,
       "hit@40": true
     }
-  ]
+  ],
+  "_ablation": {
+    "tag": "v19_xsmall_ce",
+    "production_code_path": false,
+    "USE_BM25_STOPWORDS": false,
+    "BM25_RRF_WEIGHT": 1.0,
+    "USE_CE_IN_RECALL_EVAL": true,
+    "USE_EVAL_SPEAKER_BOOST": false,
+    "USE_LLM_EXTRACTOR": false,
+    "USE_LLM_ATOMIC_RERANK": false,
+    "LLM_ATOMIC_ALPHA": 0.1,
+    "LLM_ATOMIC_SCORE_MODE": "max",
+    "LLM_ATOMIC_POOL": 40,
+    "embed_backend": "sentence-transformers",
+    "embed_model": "C:\\Users\\Sheldon Antony\\.config\\preflight\\bge-small-engram-v3",
+    "reingest": false,
+    "db_letter": "B",
+    "elapsed_s": 651.4
+  }
 }

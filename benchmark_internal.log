@@ -1,0 +1,95 @@
+============================================================
+  RECALL@K ABLATION
+============================================================
+  Tag                    : engram_v20_internal
+  _USE_BM25_STOPWORDS    : False
+  _BM25_RRF_WEIGHT       : 1.0
+  _USE_CE_IN_RECALL_EVAL : False
+  _USE_EVAL_SPEAKER_BOOST: False
+  _RRF_K                 : 15
+  _USE_DERIVED_BM25      : False
+  _POOL_A_SIZE           : 750
+  _USE_LLM_ATOMIC_RERANK : False
+  _LLM_ATOMIC_ALPHA      : 0.1
+  _LLM_ATOMIC_SCORE_MODE : max
+  _LLM_ATOMIC_POOL       : 40
+  LLM extractor          : False
+  LLM workers            : 4
+  store_turn             : False (benchmark mode)
+  Embed backend          : fastembed
+  Embed model            : (default)
+  Reingest               : False
+  Production code path   : False
+  DB path                : /home/sheldon_antony/.config/preflight/locomo_eval_B.db
+  DB exists              : True
+
+Loading dataset from /home/sheldon_antony/.config/preflight/locomo10.json ...
+  10 conversations loaded.
+
+
+============================================================
+  RECALL@K EVALUATION  (Mode B corpus)
+  DB: /home/sheldon_antony/.config/preflight/locomo_eval_B.db
+============================================================
+
+Building dia_id map (lightweight, no embeddings)...
+  Done in 0.1s — 5882 turns mapped (22885 total fact IDs)
+
+Scoring Recall@K...
+  Conv 1/10: loading embeddings...
+  Conv 2/10: loading embeddings...
+  Conv 3/10: loading embeddings...
+  Conv 4/10: loading embeddings...
+  Conv 5/10: loading embeddings...
+  Conv 6/10: loading embeddings...
+  Conv 7/10: loading embeddings...
+  Conv 8/10: loading embeddings...
+  Conv 9/10: loading embeddings...
+  Conv 10/10: loading embeddings...
+  Done in 57.3s
+
+============================================================
+  PREFLIGHT LoCoMo RECALL@K RESULTS
+============================================================
+
+Questions with evidence : 1531 / 1540
+Questions skipped (no evidence / adversarial): 9
+
+Recall@1   : 48.01%   (did the right turn rank #1?)
+Recall@3   : 66.69%   (did the right turn appear in top 3?)
+Recall@5   : 74.40%   (did the right turn appear in top 5?)
+Recall@10  : 83.67%   (did the right turn appear in top 10?)
+Recall@40  : 93.08%   (did the right turn appear in top 40?)
+
+By category (Recall@5):
+  Single-hop  : 46.07%
+  Multi-hop   : 60.85%
+  Temporal    : 74.06%
+  Open-domain : 82.05%
+
+What this means:
+  Recall@5 = 74.40% means Preflight found the answer-containing turn
+  in the top 5 results for 74% of questions.
+  This measures pure retrieval quality, independent of answer generation.
+
+Target  R@40 >= 99%  :  FAIL  (got 93.08%)
+============================================================
+
+Full results saved -> /home/sheldon_antony/.config/preflight/locomo_recall_results.json
+
+Elapsed: 57.5s
+Tagged result  -> /home/sheldon_antony/.config/preflight/locomo_recall_engram_v20_internal.json
+
+Metric     Baseline        Now     Delta  Status
+------------------------------------------------------
+  R@1         47.35      48.01     +0.66  OK
+  R@3         65.90      66.69     +0.79  OK
+  R@5         73.87      74.40     +0.53  OK
+  R@10        81.78      83.67     +1.89  OK
+  R@40        92.62      93.08     +0.46  OK
+
+  R@5 by category:
+    Single-hop    : 46.07%
+    Multi-hop     : 60.85%
+    Temporal      : 74.06%
+    Open-domain   : 82.05%
