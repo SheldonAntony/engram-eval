@@ -742,6 +742,16 @@ def ingest(samples: list, mem, mode: str) -> dict:
                             kw_facts += 1
                     except Exception:
                         pass
+
+            # v25+ hybrid: parallel chunked turn storage (Nitin pattern).
+            # Opt-in via PREFLIGHT_CHUNK_STORE=1.  Called once per session
+            # (not per turn) so each 6-turn chunk captures conversational
+            # context.  Multi-hop Qs can match the chunk in one ANN hit.
+            if session_turns:
+                try:
+                    mem.store_session_chunks(pid, sid, session_turns, timestamp=_date)
+                except Exception:
+                    pass  # never let chunk-store errors break fact ingest
     return {"total_turns": total_turns, "kw_facts": kw_facts}
 
 

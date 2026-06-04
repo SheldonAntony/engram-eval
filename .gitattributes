@@ -1,0 +1,15 @@
+# Normalize line endings to LF for all text files.
+# This repo was historically committed on a Windows mount with CRLF; this
+# attribute normalizes to LF so diffs don't show the entire file as changed
+# when touched in WSL/Linux.
+* text=auto eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.db binary
+*.pkl binary
