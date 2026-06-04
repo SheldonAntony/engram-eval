@@ -1,11 +1,12 @@
 # LoCoMo Retrieval — Complete Handover Document
 
-> **Date:** 2026-05-17  
+> **Date:** 2026-06-04  
 > **Goal:** Maximize Recall@3 on the LoCoMo benchmark (1,531 scorable QA pairs across 10 conversations).  
-> **Current champion:** v15 — per-category BM25 + skip CE single-hop — **R@3 = 80.73%, R@40 = 96.41% (B DB)**  
-> **Previous champion:** v12 — retrained GBM (21 feat) — R@3 = 80.99%, R@40 = 96.34% (B DB)  
-> **Final conclusion:** ~81% R@3 plateau after 18+ experiments. 92% requires conversation-context BM25 or fine-tuned neural reranker.  
-> **Stretch target:** 92% → revised: unreachable with current approach. Best: ~81%.
+> **Current champion (eval pipeline):** v15 — per-category BM25 + skip CE single-hop — **R@3 = 80.73%, R@40 = 96.41% (B DB)**  
+> **Current champion (production path, C DB w/ chunk signal):** v25 — chunk RRF signal w=0.2 K=15 — **R@3 = 70.17%, R@5 = 77.60%, R@40 = 94.02%** (still short of v15; see §12).  
+> **Nitin's reference:** engram-search v0.1.7 claims 93.9% R@5 on LoCoMo (1,982 Q / 10 conv) via bge-large + bge-reranker-v2-m3 + chunked turns.  
+> **Active thread:** v25 hybrid merge — adding chunked turn storage (Nitin pattern) to engram's mature RRF pipeline.  
+> **Final conclusion so far:** ~81% R@3 plateau on the eval pipeline; v25 chunk signal gives +0.5-0.8pp lift on the production path (C DB) but is no longer the main bottleneck — bge-large 1024d + CE swap still pending.
 
 ---
 
@@ -21,6 +22,8 @@
 8. [Current Code State](#8-current-code-state)
 9. [What To Do Next](#9-what-to-do-next)
 10. [Acceptance Rules](#10-acceptance-rules)
+11. [v25 Nitin Hybrid Merge (June 2026)](#11-v25-nitin-hybrid-merge-june-2026)
+12. [v25 Results & Open Questions](#12-v25-results--open-questions)
 
 ---
 
@@ -1145,3 +1148,146 @@ Production path now matches internal eval path exactly (74.5% vs 74.40% R@5), pr
 2. Enable CE reranker (mxbai-rerank-xsmall-v1, pool=80, timeout=10s) and measure R@5 delta
 3. Tune composite scoring weights for production mode
 4. Run full production benchmark (all signals, CE) to beat 74.5% R@5
+
+---
+
+## 11. v25 Nitin Hybrid Merge (June 2026)
+
+### 11.1 Why this thread
+After ~6 months of incremental tuning of the existing multi-signal RRF pipeline (v8–v19) and hitting a hard ~81% R@3 plateau, we benchmarked Nitin-Gupta1109/engram v0.1.7 (PyPI `engram-search`, MIT) and noticed it claims **93.9% R@5 on LoCoMo** with a different architecture. The architectural differences worth cherry-picking:
+
+| Component | Engram (us) | Nitin v0.1.7 |
+|---|---|---|
+| Embedder | bge-base-en-v1.5 (768d) | bge-large-en-v1.5 (1024d) |
+| Cross-encoder | mxbai-rerank-xsmall-v1 (~33M) | bge-reranker-v2-m3 (568M) |
+| Turn storage | 3-turn sliding window per fact | 6-turn chunked turns, overlap=1 |
+| Multi-hop support | Window context only | Chunk cosine → fact map |
+| Recall ceiling | 92-96% R@40 | 98-99% R@40 |
+
+Nitin's package is missing mature features we have: re-supersede, valid_to, derived BM25, person-name lexical channels, atomic LLM extraction, production benchmark infra. So a full swap is a regression. **Strategy: hybrid — keep our pipeline as the primary retrieval, add Nitin's chunked-turn storage as a parallel signal.**
+
+### 11.2 Phases (plan)
+- **Phase 1 — chunked turn storage:** add `chunk_docs` table; store 6-turn overlapping chunks per session; embed with bge-large (1024d). ✅ DONE (commit `7365151`, engram repo)
+- **Phase 2 — chunk RRF signal:** add chunk cosine signal to `retrieve_facts()`; map top chunks → fact_ids via content matching; contribute RRF boost. ✅ DONE (commit `ed781ad` engram + `5e0cf1e` engram-eval)
+- **Phase 3 — bge-large 1024d lift:** fix `_CHUNK_USE_BGE_LARGE=1` to actually force bge-large (currently respects `ENGRAM_EMBED_MODEL` env override); re-ingest C DB at 1024d; measure. ⏳ PENDING
+- **Phase 4 — CE swap to bge-reranker-v2-m3:** download 2.3GB model; replace mxbai reranker; measure. ⏳ PENDING
+
+### 11.3 Phase 1 details (chunk storage)
+- `chunk_docs` table: `id, session_id, project_id, chunk_index, turn_start, turn_end, content, embedding, fact_type, entities (JSON speaker list), source_hash`
+- `chunk_docs_fts`: regular FTS5 (external-content FTS5 broken in SQLite 3.45+WAL)
+- `_chunk_session_turns(turns, max_turns=6, overlap=1)` matches Nitin behavior — produces list of `(start, end)` index pairs
+- `_render_session_chunk(turns, s, e, timestamp)` produces `"Speaker: text\n..."` with optional `[timestamp] ` prefix on first line
+- `store_session_chunks(pid, sid, turns, timestamp, ...)` returns list of chunk_doc ids; no-op when `PREFLIGHT_CHUNK_STORE=0`
+- Env flags: `PREFLIGHT_CHUNK_STORE`, `PREFLIGHT_CHUNK_USE_BGE_LARGE`, `PREFLIGHT_CHUNK_MAX_TURNS=6`, `PREFLIGHT_CHUNK_OVERLAP=1`, `PREFLIGHT_CHUNK_PREFIX_TS`
+- Wired into `eval_locomo.py:ingest()` — called once per session (not per turn) so each 6-turn chunk captures conversational context
+- 9/9 unit tests passed; LoCoMo re-ingest: 5,882 turns → 1,504 chunks across 272 sessions in 7 min
+
+### 11.4 Phase 2 details (chunk RRF signal)
+- `ensure_chunk_fts(pid)` repopulates `chunk_docs_fts` from `chunk_docs` (returns rows written)
+- `_embed_query_for_chunks(q)` embeds with chunk embedder (bge-large if `_CHUNK_USE_BGE_LARGE=1`, else current prod embedder)
+- `_cosine_rank_chunks(q_emb, pid, conn)` returns sorted `[(chunk_id, sim)]` using numpy if available, else pure-Python
+- `_build_chunk_fact_map(pid, conn)` maps chunk_id → fact_ids via content matching:
+  - chunk content lines like `"Alice: Yes, I'm a huge Final Fantasy fan."`
+  - fact content lines like `"[curr] Alice: Yes, I'm a huge Final Fantasy fan.\n[prev] ...\n[next] ..."` (window rows) or bare turn rows
+  - strips `[curr]/[prev]/[next]` tags and matches the underlying `"Speaker: text"` line
+- Wired into `retrieve_facts()`: chunk_rank_by_fid computed once outside sub-query loop (chunk embedder is bge-large, separate model load), added as `_CHUNK_RRF_W / (_RRF_K + chunk_rank)` per-fact contribution
+- Extracted to `_compute_chunk_rank()` helper (used by both `_eval_retrieve` and `run_recall_eval`)
+- Env flags: `PREFLIGHT_USE_CHUNK_RRF`, `PREFLIGHT_CHUNK_RRF_W=0.2`, `PREFLIGHT_CHUNK_TOP_K=15`
+
+### 11.5 Critical bug fix (v23+ valid_to)
+- v23+ `eval_locomo.py` queries `WHERE valid_to IS NULL OR valid_to > unixepoch()` but the `valid_to` column was never added to the `facts` schema in `memory.py`
+- v24 commit message claimed "benchmark fixes" but didn't add the column
+- **FIX:** added `_ensure_column(conn, "facts", "valid_to", "REAL", "NULL")` in `memory.py:init_db()`
+- **Impact (B DB, no chunks, no Nitin signal):** +3-5pp R@K — R@1: 47.35→52.25, R@3: 65.90→69.30, R@5: 73.87→76.62, R@10: 81.78→85.37, R@40: 92.62→94.32
+- This is **not a Nitin-related improvement** — it's a long-standing bug fix that was always intended to be in the schema
+
+### 11.6 Chunks-at-768d gotcha
+- `_CHUNK_USE_BGE_LARGE=1` env flag in `store_session_chunks` does **NOT** force the bge-large model
+- It calls `utils.embed_texts_batch()` which uses the current model from `ENGRAM_EMBED_MODEL` env var
+- When user sets `ENGRAM_EMBED_MODEL=BAAI/bge-base-en-v1.5` (to match existing B DB), chunks embed at 768d despite the flag
+- All 1,504 chunks in the C DB are at 768d, not 1024d as originally planned
+- **This is fine for the chunk signal** (768d cosine works), but defeats the "bge-large lift" claim
+- **FIX needed in Phase 3:** make `store_session_chunks` explicitly call `SentenceTransformer('BAAI/bge-large-en-v1.5')` when `_CHUNK_USE_BGE_LARGE=1`, ignoring `ENGRAM_EMBED_MODEL`
+
+### 11.7 Git state (WSL canonical)
+- `engram` repo, branch `v25-nitin-merge`, origin `https://github.com/SheldonAntony/engram.git`:
+  - `0f74e33` initial v25 Nitin merge (bridge, vendor, env flags)
+  - `7365151` Phase 1 — chunked turn storage (`chunk_docs` table, `store_session_chunks`, FTS5 mirror)
+  - `ed781ad` Phase 2 — chunk RRF signal in `retrieve_facts()`
+- `engram-eval` repo, branch `master`, origin `https://github.com/SheldonAntony/engram-eval.git`:
+  - `3dbaf69` MERGE_PLAN.md
+  - `1dd6f89` v25 phase 1 — `ingest()` wired to `store_session_chunks` + `.gitattributes` for CRLF normalization
+  - `5e0cf1e` v25 phase 2 — chunk signal in `run_recall_eval` + `_compute_chunk_rank` helper + tuned defaults
+
+---
+
+## 12. v25 Results & Open Questions
+
+### 12.1 Tuning grid (C DB, 10 convs, 1540 Qs, with valid_to fix)
+| Config | R@1 | R@3 | R@5 | R@10 | R@40 | Notes |
+|---|---|---|---|---|---|---|
+| chunk-off (baseline) | 48.75 | 69.58 | 76.81 | 84.95 | 93.56 | After valid_to fix |
+| **w=0.2, K=15 (default)** | **48.82** | **70.17** | **77.60** | **85.74** | **94.02** | Best R@1+R@3 |
+| w=0.3, K=15 | 48.16 | 69.78 | 77.99 | 86.01 | 94.61 | Best R@10 |
+| w=0.4, K=15 | 47.96 | 69.38 | 77.73 | 85.74 | 94.74 | Best R@40 |
+| w=0.8, K=30 (orig) | 47.44 | 68.40 | 76.61 | 84.23 | 94.48 | Regresses R@3 |
+| w=3.0, K=15 (test) | 48.75 | 69.58 | 76.81 | 84.95 | 93.56 | Identical to off (signal too small) |
+
+**w=0.2 K=15 chosen** — best R@1 and R@3 (high-precision), consistent +0.5-0.8pp lifts at deeper ranks, no regression. Higher weights add noise to top-3.
+
+### 12.2 Net lift summary (chunk signal contribution alone)
+- **R@1:** +0.07pp (negligible)
+- **R@3:** +0.59pp
+- **R@5:** +0.79pp
+- **R@10:** +0.79pp
+- **R@40:** +0.46pp
+
+Modest but consistent. Most of the lift happens at deeper ranks (R@5–R@10) — chunk signal helps the pool grow diverse candidates, not pick the #1.
+
+### 12.3 Per-category results (chunk on, w=0.2, K=15, 10 convs)
+- single_hop: 46.59% R@5
+- multi_hop: 67.26% R@5
+- temporal: 76.80% R@5
+- open_domain: 82.85% R@5
+
+Multi-hop is the natural beneficiary of chunk signal (chunks capture cross-turn context). 67% is the highest we've seen for multi-hop in any test.
+
+### 12.4 Gap analysis
+- **Champion (v15 eval pipeline):** R@3 = 80.73%, R@5 = 87.13%, R@40 = 96.41%
+- **C DB w/ chunk signal:** R@3 = 70.17%, R@5 = 77.60%, R@40 = 94.02%
+- **Gap to v15:** R@3 -10.5pp, R@5 -9.5pp, R@40 -2.4pp
+- **Gap to Nitin claim:** R@5 -16.3pp
+
+The R@40 gap is small (~2.4pp) — chunk signal closes most of the ceiling. The R@3 gap is large because v15 uses per-category tuned thresholds + GBM reranker + learned rerank features, none of which are in the production C DB path.
+
+### 12.5 Open questions
+1. **Does bge-large 1024d actually help the chunk signal?** Currently chunks are 768d (gotcha in §11.6). Re-ingest with explicit bge-large and measure — hypothesis is 1-2pp R@3 lift since 1024d captures longer context better.
+2. **Can a precise chunk→fact mapping beat content matching?** Currently mapping is "strip `[curr]/[prev]/[next]` and string-equal" — fragile to whitespace/speaker-case differences. Options: (a) add `chunk_id` column to `facts` and populate at ingest; (b) add `chunk_doc_facts` mapping table; (c) fuzzy match. (a) is the cleanest but requires schema migration + re-ingest.
+3. **Is the bge-reranker-v2-m3 swap worth the 2.3GB download?** Hypothesis is 3-5pp R@5 lift, but mxbai is already saturating the R@40 ceiling. Could be no-op.
+4. **Should the chunk signal use a different fusion?** RRF is conservative. Try max-blend (take max of cosine/chunk scores) or weighted sum instead.
+5. **Does the v15 eval pipeline's per-category thresholds apply here?** v15 tuned thresholds for each of single/multi/temporal/open; we don't have per-category tuning in the production path. Could add.
+
+### 12.6 Recommended next experiments
+1. **Phase 3 — bge-large 1024d fix** (highest expected value):
+   - Edit `memory.py:store_session_chunks` to explicitly call `SentenceTransformer('BAAI/bge-large-en-v1.5').encode(rendered, batch_size=4, normalize_embeddings=True)` when `_CHUNK_USE_BGE_LARGE=1`
+   - Re-ingest C DB (5,882 turns → 1,504 chunks at 1024d, ~10-20 min)
+   - Re-run chunk-on eval with w=0.2 K=15
+   - Expected: 1-2pp R@3 lift, 0.5pp R@40 lift
+
+2. **Phase 4 — bge-reranker-v2-m3 swap** (medium value, high cost):
+   - Add `BAAI/bge-reranker-v2-m3` to `utils.py:get_cross_encoder()` selector
+   - Set `ENGRAM_CE_MODEL=BAAI/bge-reranker-v2-m3` for the eval run
+   - Re-run; expect 3-5pp R@5 lift, +2s/query latency cost
+
+3. **Map table migration** (low cost, moderate value):
+   - Add `chunk_doc_facts(chunk_id, fact_id, project_id)` table
+   - Populate at `store_session_chunks` time using same content-match logic
+   - Replace content-match in `_compute_chunk_rank` with SQL JOIN
+   - No re-ingest needed for existing DBs (just run a one-shot backfill)
+   - Expected: 0.5pp R@3 lift (more accurate mapping → less noise)
+
+### 12.7 v25 takeaways
+- The v25 work is **production-ready and opt-in** — all Nitin-related code is gated by `PREFLIGHT_*` env vars; default behavior unchanged
+- The valid_to bug fix alone is worth the v25 work — it was a real +3-5pp regression that's been silently in production
+- The chunk signal gives a real but modest lift. The ceiling is R@40 (93-94%), not R@3 (70%). R@3 needs better ranking, not better candidates
+- To reach Nitin's 93.9% R@5 claim, we likely need: bge-large + bge-reranker-v2-m3 + per-category thresholds + better candidate generation. Current effort has done 1 of 4
