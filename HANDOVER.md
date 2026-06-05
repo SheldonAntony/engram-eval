@@ -1439,3 +1439,137 @@ Possible explanations:
 4. **Nitin's per-category thresholds** — would close 1-2pp
 5. **Nitin's chunked_turns as primary fact storage** (not parallel) — would close 2-3pp
 
+---
+
+## 14. v25p9 — GBM Reranker Added (June 2026)
+
+### 14.1 Why this thread
+v25p8 reached R@3=80.22% (within 0.51pp of v15 champion 80.73%). The natural next step was to add the trained GBM learned reranker from `reranker_model.pkl` (24 features, LOOCV R@3=70.27% from old training). The GBM was originally trained on the B DB without chunk signal — question was whether it would still help now that chunks+bge-CE are the primary rerankers.
+
+### 14.2 v25p9 config
+
+```bash
+export PREFLIGHT_USE_CHUNK_RRF=1
+export PREFLIGHT_CHUNK_RRF_W=0.2
+export PREFLIGHT_CHUNK_TOP_K=15
+export PREFLIGHT_CHUNK_USE_BGE_LARGE=1
+export PREFLIGHT_RRF_K=15
+export PREFLIGHT_USE_DERIVED_BM25=1
+export PREFLIGHT_USE_LEARNED_RERANK=1        # NEW
+export PREFLIGHT_LEARNED_RERANK_POOL=80
+export PREFLIGHT_LEARNED_RERANK_ALPHA=3.0    # blend with RRF
+export PREFLIGHT_USE_CE=1
+export PREFLIGHT_CE_POOL=200
+export PREFLIGHT_CE_GUARD_K=40
+export PREFLIGHT_CE_MODEL=BAAI/bge-reranker-v2-m3
+```
+
+Pipeline order: cosine ANN → BM25 FTS5 → derived BM25 → chunk RRF (1024d bge-large) → GBM rerank (top-80) → bge-CE rerank (top-200) → CE guard.
+
+### 14.3 v25p9 result — **NEW CHAMPION, BEATS v15 ON ALL METRICS**
+
+`locomo_recall_v25p9_gbm_chunk_derived_bgeCE.json` (C DB, 1540 Qs, 1522 evidence)
+
+| Metric | v25p8 (no GBM) | **v25p9 (with GBM)** | v15 champion | v25p9 vs v15 |
+|--------|----------------|----------------------|--------------|--------------|
+| R@1    | 64.59% | 64.59% | 64.21% | +0.38 |
+| R@3    | 80.22% | **81.80%** | 80.73% | **+1.07** ✅ |
+| R@5    | 86.60% | **87.39%** | 87.13% | **+0.26** ✅ |
+| R@10   | 91.33% | **91.92%** | 90.92% | **+1.00** ✅ |
+| R@40   | 96.32% | **96.71%** | 96.41% | **+0.30** ✅ |
+
+By category (R@5): SH=54.55, MH=82.92, Temp=86.83, OD=92.57
+
+GBM helps:
+- R@3: +1.58pp vs v25p8
+- R@5: +0.79pp vs v25p8
+- R@40: +0.39pp vs v25p8
+
+### 14.4 What the GBM learned
+
+The GBM was trained on the OLD feature distribution (no chunk signal, mxbai CE). Now operating on the NEW feature distribution (chunk + bge-CE), it still helps because:
+- `rrf_score`, `rrf_rank_norm` features reflect the new RRF distribution (chunk-augmented)
+- `bm25_rank_norm`, `derived_rank_norm` features work the same
+- `name/date/bigram_hit_count` features still useful
+- `is_temporal/is_multihop/is_single_hop/is_open_domain` category features still work
+
+The GBM reranks top-80 from RRF, then alpha=3.0 blends with original RRF (preventing GBM from going too far afield). Then bge-CE reranks top-200, then guard.
+
+### 14.5 Full v25 progression (C DB, 1540 Qs, B DB-derived config)
+
+| Config | R@1 | R@3 | R@5 | R@10 | R@40 | Time |
+|--------|-----|-----|-----|------|------|------|
+| v25 baseline (768d chunks, no CE) | 48.82 | 70.17 | 77.60 | 85.74 | 94.02 | ~10 min |
+| v25p3 chunk(1024d) | 49.47 | 70.57 | 77.79 | 86.07 | 94.68 | 4 min |
+| v25p4 + bge-CE p40 | 64.45 | 79.37 | 84.89 | 89.55 | 94.68 | 33 min |
+| v25p6 bge-CE p80 | 64.78 | 80.03 | 85.81 | 90.80 | 95.73 | 26 min |
+| v25p7 bge-CE p200 | 64.65 | 80.03 | 86.33 | 91.59 | 96.45 | 57 min |
+| v25p8 + derived BM25 | 64.59 | 80.22 | 86.60 | 91.33 | 96.32 | 82 min |
+| **v25p9 + GBM reranker** | **64.59** | **81.80** | **87.39** | **91.92** | **96.71** | 57 min |
+
+### 14.6 Per-category gains (v25 baseline → v25p9)
+
+| Category | Baseline R@5 | v25p9 R@5 | Total Delta |
+|----------|-------------|-----------|-------------|
+| single_hop | 45.45 | 54.55 | **+9.10** |
+| multi_hop  | 69.04 | 82.92 | **+13.88** |
+| temporal   | 76.80 | 86.83 | **+10.03** |
+| open_domain | 84.53 | 92.57 | **+8.04** |
+
+### 14.7 Production readiness
+
+**v25p9 is the new production champion for the eval pipeline benchmark.**
+
+For production (memory.py) use, GBM is opt-in and off by default — it requires a pre-trained model file. The architectural changes ARE production-safe:
+- chunk storage + 1024d bge-large (opt-in via PREFLIGHT_CHUNK_STORE=1 + PREFLIGHT_CHUNK_USE_BGE_LARGE=1)
+- bge-reranker-v2-m3 CE (default since v20+)
+- derived BM25 (opt-in via PREFLIGHT_USE_DERIVED_BM25=1)
+- broad pool=200, RRF_K=15, CE_GUARD=40, COVERAGE=40 (already default in production)
+
+**Recommended production env vars (for max recall):**
+```bash
+export PREFLIGHT_USE_CHUNK_RRF=1
+export PREFLIGHT_CHUNK_RRF_W=0.2
+export PREFLIGHT_CHUNK_TOP_K=15
+export PREFLIGHT_CHUNK_USE_BGE_LARGE=1
+export PREFLIGHT_USE_DERIVED_BM25=1
+export PREFLIGHT_USE_CE=1
+export PREFLIGHT_CE_POOL=200
+export PREFLIGHT_CE_GUARD_K=40
+export PREFLIGHT_CE_MODEL=BAAI/bge-reranker-v2-m3
+export ENGRAM_EMBED_MODEL=BAAI/bge-base-en-v1.5
+export ENGRAM_EMBED_BACKEND=fastembed
+```
+
+Latency cost: bge-CE on CPU adds ~5-10s per query (pool=200). For sub-second production use, fall back to PREFLIGHT_CE_POOL=40 (R@3=79.37%, R@40=94.68%).
+
+### 14.8 Remaining gap to Nitin 93.9% R@5 claim
+
+Current: R@5=87.39% → Nitin claim: 93.9% → gap: -6.5pp R@5 (closed 0.8pp today)
+
+Possible explanations (unchanged from §13.11):
+1. **Nitin's bge-large + bge-CE for facts** (not just chunks) — would close 2-3pp
+2. **Nitin's chunk mapping is exact (chunk_id column on facts)** — would close 0.5pp
+3. **Nitin's 1,982-Q test set** vs our 1,540-Q LoCoMo — different difficulty profile
+4. **Nitin's per-category thresholds** — would close 1-2pp
+5. **Nitin's chunked_turns as primary fact storage** (not parallel) — would close 2-3pp
+
+### 14.9 v25p9 takeaways
+
+- **Architecture wins:** chunk(1024d) + bge-CE + derived BM25 + GBM reranker = R@3=81.80%, R@5=87.39%, R@40=96.71% — all beat v15 champion
+- **Biggest single lift:** bge-CE (mxbai→bge-CE gave +8.80pp R@3 alone in v25p4)
+- **GBM reranker is robust:** trained on old features, still works with new chunk+bge-CE signals (+1.58pp R@3 on top of v25p8)
+- **Pool matters more than expected:** pool=200 vs pool=40 gave +0.66pp R@3 and +1.77pp R@40
+- **Dim matters but modestly:** 768d → 1024d chunks gave +0.40pp R@3 and +0.66pp R@40
+- **All 4 base signals are worth keeping:** cosine + BM25 + derived + chunk
+- **Lexical + context channels hurt when bge-CE is on:** v25p5 (all-signals) regressed R@10/R@40
+
+### 14.10 Next experiments (priority order)
+
+1. **v25p10:** Retrain GBM with `chunk_rank_norm` and `chunk_found` as 2 new features (25-26 features total). Should give +0.5-1pp R@3.
+2. **v25p11:** Try GBM pool=200 (match CE pool) to see if more candidates help GBM.
+3. **v25p12:** Per-category alpha tuning (single_hop: alpha=0, multihop: alpha=5, etc.).
+4. **v25p13:** Bump CE pool to 300 to test ceiling.
+
+
+
