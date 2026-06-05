@@ -98,6 +98,10 @@ _BROAD_POOL         = int(os.environ.get("PREFLIGHT_BROAD_POOL", "0"))
 _USE_CHUNK_RRF      = os.environ.get("PREFLIGHT_USE_CHUNK_RRF", "0") == "1"
 _CHUNK_RRF_W        = float(os.environ.get("PREFLIGHT_CHUNK_RRF_W", "0.2"))
 _CHUNK_TOP_K        = int(os.environ.get("PREFLIGHT_CHUNK_TOP_K", "15"))
+# v25+ Phase 3: when 1, chunk query embedding uses bge-large (1024d) regardless
+# of ENGRAM_EMBED_MODEL.  Chunk embeddings and chunk query embeddings must share
+# the same model.  Matches memory.py:_CHUNK_USE_BGE_LARGE.
+_CHUNK_USE_BGE_LARGE = os.environ.get("PREFLIGHT_CHUNK_USE_BGE_LARGE", "0") == "1"
 
 # Lexical explicit-memory channels: inject three targeted candidate channels
 # into the broad pool before RRF/GBM reranking:
@@ -592,12 +596,26 @@ def _compute_chunk_rank(
 
     Used by both _eval_retrieve() and run_recall_eval() so the chunk signal
     is consistent across F1 and recall evaluation paths.
+
+    v25+ Phase 3: when PREFLIGHT_CHUNK_USE_BGE_LARGE=1, query embedding uses
+    bge-large (1024d) regardless of ENGRAM_EMBED_MODEL, matching the chunk
+    embedding dim.  This is the dedicated chunk embedder; falls back to _ue
+    if bge-large load fails.
     """
     out: dict[int, int] = {}
     if not _USE_CHUNK_RRF:
         return out
     try:
-        _q_emb = _ue(question)
+        # v25+ Phase 3: prefer bge-large for chunk query embedding
+        _q_emb = None
+        if _CHUNK_USE_BGE_LARGE:
+            try:
+                from utils import embed_text_bge_large as _qet_bl  # type: ignore  # noqa: PLC0415
+                _q_emb = _qet_bl(question)
+            except Exception:
+                _q_emb = None
+        if _q_emb is None:
+            _q_emb = _ue(question)
         _chunk_rows = conn.execute(
             "SELECT id, embedding FROM chunk_docs "
             "WHERE project_id = ? AND embedding IS NOT NULL",
