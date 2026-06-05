@@ -1291,3 +1291,151 @@ The R@40 gap is small (~2.4pp) — chunk signal closes most of the ceiling. The 
 - The valid_to bug fix alone is worth the v25 work — it was a real +3-5pp regression that's been silently in production
 - The chunk signal gives a real but modest lift. The ceiling is R@40 (93-94%), not R@3 (70%). R@3 needs better ranking, not better candidates
 - To reach Nitin's 93.9% R@5 claim, we likely need: bge-large + bge-reranker-v2-m3 + per-category thresholds + better candidate generation. Current effort has done 1 of 4
+
+---
+
+## 13. v25 Phases 3 + 4 — bge-large Chunks + bge-reranker CE (June 2026)
+
+### 13.1 Why this thread
+With the structural v25 work landed (chunks 1024d is the natural next step), we wanted to push R@3 toward v15's 80.73% and R@40 toward 96-97%. Two natural levers remained from §12.6: (1) actually use bge-large 1024d for chunks (the §11.6 bug was fixed but not yet exercised end-to-end), and (2) swap mxbai-rerank-xsmall for bge-reranker-v2-m3.
+
+### 13.2 Phase 3 — bge-large 1024d chunk embedder (fixes §11.6 gotcha)
+
+**The bug** (now fixed, commit `e0861ab` in engram + `25370c9` in engram-eval):
+- `_CHUNK_USE_BGE_LARGE=1` flag was being shadowed by `ENGRAM_EMBED_MODEL` env var
+- Result: chunks embedded at 768d (bge-base) instead of 1024d (bge-large) when user set base for B DB compat
+- All 1,504 chunks in C DB were at 768d (`3072 bytes` per embedding = 768 float32)
+
+**The fix** (utils.py + memory.py):
+- `utils.py:embed_text_bge_large()` and `embed_texts_batch_bge_large()` added — lazy-loaded bge-large model with BGE query prefix, batched+chunked encoding for long texts, normal batch=32 / long-text batch=16
+- `memory.py:store_session_chunks()` calls `embed_texts_batch_bge_large` when `_CHUNK_USE_BGE_LARGE=1`; falls back to prod embedder per-text on model load failure
+- `memory.py:_embed_query_for_chunks()` uses `embed_text_bge_large` regardless of `ENGRAM_EMBED_MODEL`
+- `eval_locomo.py:_compute_chunk_rank()` matches: uses `embed_text_bge_large` for chunk query embedding
+
+**C DB re-ingest:**
+- 5,882 turns → 1,504 chunks, all 4096 bytes (1024d float32) ✅
+- 6,099 facts, all 3072 bytes (768d bge-base for fact compat) ✅
+- Ingest time: 115s
+- Models loaded: bge-base-en-v1.5 (facts) + bge-large-en-v1.5 (chunks)
+
+### 13.3 Phase 3 results — chunk(1024d) w=0.2 K=15 (no CE)
+
+`locomo_recall_v25p3_chunk_w0.2_k15_1024d.json` (C DB, 1540 Qs, 1522 evidence)
+
+| Metric | v25 §12.1 (768d) | v25p3 (1024d) | Delta |
+|--------|------------------|---------------|-------|
+| R@1    | 48.82 | 49.47 | **+0.65** |
+| R@3    | 70.17 | 70.57 | **+0.40** |
+| R@5    | 77.60 | 77.79 | +0.19 |
+| R@10   | 85.74 | 86.07 | +0.33 |
+| R@40   | 94.02 | 94.68 | **+0.66** |
+
+By category (R@5): SH=45.45 MH=69.04 Temp=76.80 OD=84.53
+
+Modest but consistent lift across all ranks. The 1024d capture of 6-turn chunks adds ~0.4pp at R@3 and ~0.7pp at R@40. Below the v15 eval pipeline ceiling — needs a stronger reranker.
+
+### 13.4 Phase 4 — bge-reranker-v2-m3 cross-encoder
+
+**The swap** (was already done in utils.py v20+ default):
+- `utils.py:_DEFAULT_CE = "BAAI/bge-reranker-v2-m3"` (568M params, 2.3GB) — Nitin-Gupta1109/engram default
+- Set `PREFLIGHT_USE_CE_LEGACY=1` to restore mxbai-rerank-xsmall (50M params, 80MB)
+- Set `PREFLIGHT_CE_MODEL=...` to override (e.g. bge-reranker-v2-base for 290M)
+
+**Why bge-CE on CPU is feasible now:**
+- 2.3GB model + 1.3GB bge-large = 3.6GB total (well within 16GB WSL RAM)
+- 568M params with torch's CPU threading saturates ~2 cores at ~120% CPU
+- Per-pair inference ~30-50ms on modern x86 → pool=200 ≈ 6-10s per question
+- 1522 Qs × 10s ≈ 4-5 hours worst case; 1-2 hours for pool=40-80
+
+### 13.5 Phase 4 results — chunk(1024d) + bge-CE pool sweep
+
+| Config | R@1 | R@3 | R@5 | R@10 | R@40 | SH | MH | Temp | OD | Time |
+|--------|-----|-----|-----|------|------|-----|-----|------|-----|------|
+| v25p4 (pool=40) | 64.45 | 79.37 | 84.89 | 89.55 | 94.68 | 52.27 | 80.07 | 83.39 | 90.53 | 33 min |
+| **v25p6 (pool=80)** | 64.78 | **80.03** | 85.81 | 90.80 | 95.73 | 51.14 | 80.43 | 85.58 | 91.37 | 26 min |
+| **v25p7 (pool=200)** | 64.65 | **80.03** | 86.33 | **91.59** | **96.45** | **54.55** | 81.49 | 85.89 | 91.49 | 57 min |
+| **v25p8 (pool=200 + derived BM25)** | 64.59 | **80.22** | **86.60** | 91.33 | 96.32 | 53.41 | **81.85** | **86.52** | **91.73** | 82 min |
+
+(R@5 category breakdown: SH/MH/Temp/OD)
+
+### 13.6 Phase 4 winners
+
+- **R@3 champion:** v25p8 (chunk + derived BM25 + bge-CE pool=200) — **80.22%**
+  - 0.51pp from v15 eval pipeline (80.73%)
+  - 16.05pp from v25 baseline (64.17%)
+- **R@40 champion:** v25p7 (chunk + bge-CE pool=200) — **96.45%**
+  - **BEATS** v15 eval pipeline (96.41%) by 0.04pp ✅
+- **R@5 champion:** v25p8 — **86.60%** (0.53pp from v15)
+
+### 13.7 Pool size trade-off
+
+| Pool | R@3 | R@40 | Time | Verdict |
+|------|-----|------|------|---------|
+| 40 | 79.37 | 94.68 | 33 min | Too small — gold at rank 41-200 is missed |
+| 80 | 80.03 | 95.73 | 26 min | Sweet spot for R@3 ceiling |
+| 200 | 80.03 | **96.45** | 57 min | Best for R@40 (rescues 14+ temporal/multi-hop) |
+
+CE_POOL=200 is the right default for the production C DB. The eval pipeline's v8 champion also used pool=200 (HANDOVER §6).
+
+### 13.8 v25p5 — all signals experiment (FAILED)
+
+`v25p5_allsignals_bgeCE_p40.json`: chunk + derived + lexical + context + bge-CE (pool=40)
+
+| Metric | v25p4 (p4) | v25p5 (all) | Delta |
+|--------|------------|-------------|-------|
+| R@1    | 64.45 | 64.72 | +0.27 |
+| R@3    | 79.37 | 79.63 | +0.26 |
+| R@5    | 84.89 | 85.28 | +0.39 |
+| R@10   | 89.55 | 88.83 | **-0.72** |
+| R@40   | 94.68 | 93.36 | **-1.32** |
+
+Adding derived+lexical+context BM25 alongside bge-CE HURT R@10 and R@40. Extra signals add noise to the broad pool; CE's top-40 rerank picks wrong items because wrong ones have stronger RRF scores. The lex+context channels were designed for the old (pre-CE) ranking and now compete with CE.
+
+**Verdict:** Use derived BM25 ONLY (v25p8). Skip context+lexical when bge-CE is on.
+
+### 13.9 Per-category gains (v25 baseline → v25p8)
+
+| Category | Baseline R@5 | v25p8 R@5 | Delta |
+|----------|-------------|-----------|-------|
+| single_hop | 45.45 | 53.41 | **+7.96** |
+| multi_hop  | 69.04 | 81.85 | **+12.81** |
+| temporal   | 76.80 | 86.52 | **+9.72** |
+| open_domain | 84.53 | 91.73 | **+7.20** |
+
+**Multi-hop got the biggest boost (+12.81pp)** — the chunk signal captures cross-turn context exactly what multi-hop questions need. bge-CE then surfaces the right chunk-derived facts.
+
+### 13.10 Production readiness
+
+**v25p8 config is the new production champion:**
+```bash
+export PREFLIGHT_USE_CHUNK_RRF=1
+export PREFLIGHT_CHUNK_RRF_W=0.2
+export PREFLIGHT_CHUNK_TOP_K=15
+export PREFLIGHT_CHUNK_USE_BGE_LARGE=1      # forces 1024d
+export PREFLIGHT_RRF_K=15
+export PREFLIGHT_USE_DERIVED_BM25=1
+export PREFLIGHT_USE_CE=1
+export PREFLIGHT_CE_POOL=200
+export PREFLIGHT_CE_GUARD_K=40
+export PREFLIGHT_CE_MODEL=BAAI/bge-reranker-v2-m3
+export ENGRAM_EMBED_MODEL=BAAI/bge-base-en-v1.5  # facts at 768d
+export ENGRAM_EMBED_BACKEND=fastembed
+```
+
+**Defaults to update in memory.py / utils.py:**
+- `_CHUNK_USE_BGE_LARGE` already defaults to "1" (the fix)
+- `_DEFAULT_CE` already `BAAI/bge-reranker-v2-m3` (v20+)
+- Need to flip: `_USE_DERIVED_BM25`, `_USE_CHUNK_RRF`, `_USE_CE` defaults to "1"
+- Add new default: `_CE_POOL_SIZE=200`, `_CHUNK_RRF_W=0.2`, `_CHUNK_TOP_K=15`
+
+### 13.11 Remaining gap to Nitin 93.9% R@5 claim
+
+Current: R@5=86.60% → Nitin claim: 93.9% → gap: -7.3pp R@5
+
+Possible explanations:
+1. **Nitin's bge-large + bge-CE for facts** (not just chunks) — would close 2-3pp
+2. **Nitin's chunk mapping is exact (chunk_id column on facts)** — would close 0.5pp
+3. **Nitin's 1,982-Q test set** vs our 1,540-Q LoCoMo — different difficulty profile
+4. **Nitin's per-category thresholds** — would close 1-2pp
+5. **Nitin's chunked_turns as primary fact storage** (not parallel) — would close 2-3pp
+
