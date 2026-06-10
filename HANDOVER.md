@@ -1571,5 +1571,49 @@ Possible explanations (unchanged from §13.11):
 3. **v25p12:** Per-category alpha tuning (single_hop: alpha=0, multihop: alpha=5, etc.).
 4. **v25p13:** Bump CE pool to 300 to test ceiling.
 
+---
+
+## 15. Production Speed Fix & Nitin Feature Ablation (2026-06-10)
+
+### 15.1 Problem
+Production `retrieve_facts()` took **5s per query** — 97% spent in Python `sum()` inside `cosine_similarity()` called 108K times per query.
+
+### 15.2 Fix Applied
+**memory.py:2132** — Replaced per-pair `cosine_similarity()` with numpy batch matmul:
+```python
+_cos_scores = _embs_normed @ _qvec  # single matrix multiply
+```
+
+**memory.py:2760** — Vectorized MMR loop with numpy (greedy selection using pre-computed cosine scores).
+
+**Bug fixed:** MMR section returned `(0, fid)` tuples but downstream expected `(score, fid, content, ef, lra, rc)`. Fixed by preserving original row data.
+
+### 15.3 Speed Result
+- **Before:** 5.0s/query (108K Python `sum()` calls)
+- **After:** 0.35s/query (numpy batch operations)
+- **Speedup:** 14x
+
+### 15.4 Full 10-Conv Benchmark Results (Nitin Feature Ablation)
+
+| Config | R@1 | R@3 | R@5 | R@10 | R@40 |
+|--------|-----|-----|-----|------|------|
+| **RRF_K=15, no CE** | 48.82% | 67.87% | **74.90%** | 84.43% | 93.69% |
+| **RRF_K=30, no CE** | 47.75% | 67.54% | 74.31% | 83.64% | 93.89% |
+| **RRF_K=60, no CE** | 48.09% | 66.95% | 74.38% | 82.98% | 93.17% |
+| **RRF_K=15 + Nitin boosts** | 48.82% | 67.87% | **74.90%** | 84.43% | 93.69% |
+| **RRF_K=15 + all Nitin** | 45.53% | 67.08% | 74.57% | 84.03% | 93.56% |
+| **Previous v19 (no CE)** | 49.25% | 68.91% | 75.18% | 82.36% | 92.88% |
+| **Previous v19 (xsmall CE)** | 57.48% | 77.20% | **82.95%** | 88.83% | 95.36% |
+
+### 15.5 Key Findings
+1. **RRF_K=15 is optimal** — K=15 beats K=30 and K=60 on R@5
+2. **Nitin boosts don't help** — Same R@5 (74.90%) with or without `ENGRAM_USE_NITIN_BOOSTS=1`
+3. **All Nitin features combined slightly hurt** — R@5 drops from 74.90% to 74.57%
+4. **CE is the biggest lever** — v19 with CE: 82.95% vs without: 75.18% (+7.77 points)
+5. **Current R@5 plateau: ~75% without CE, ~83% with CE**
+6. **Gap to Nitin's 93.9%: ~11 percentage points** — requires fundamentally different approach
+
+### 15.6 Files Modified
+- `/home/sheldon_antony/.config/opencode/memory.py` — numpy batch matmul for cosine_similarity + MMR vectorization
 
 
