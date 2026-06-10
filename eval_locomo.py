@@ -90,6 +90,19 @@ _LEARNED_RERANK_ALPHA   = float(os.environ.get("PREFLIGHT_LEARNED_RERANK_ALPHA",
 # Set to e.g. 200 to take top-200 from cos + bm25 + derived before RRF.
 _BROAD_POOL         = int(os.environ.get("PREFLIGHT_BROAD_POOL", "0"))
 
+# v25+ chunk RRF signal (Nitin pattern).  When enabled, embed the query
+# with bge-large (1024d), cosine-rank all chunks for the project, and
+# map top chunks to their constituent fact_ids.  Each mapped fact_id
+# receives an RRF contribution so a chunk hit boosts its facts.  Opt-in
+# (default off) so the existing eval pipeline is unchanged.
+_USE_CHUNK_RRF      = os.environ.get("PREFLIGHT_USE_CHUNK_RRF", "0") == "1"
+_CHUNK_RRF_W        = float(os.environ.get("PREFLIGHT_CHUNK_RRF_W", "0.2"))
+_CHUNK_TOP_K        = int(os.environ.get("PREFLIGHT_CHUNK_TOP_K", "15"))
+# v25+ Phase 3: when 1, chunk query embedding uses bge-large (1024d) regardless
+# of ENGRAM_EMBED_MODEL.  Chunk embeddings and chunk query embeddings must share
+# the same model.  Matches memory.py:_CHUNK_USE_BGE_LARGE.
+_CHUNK_USE_BGE_LARGE = os.environ.get("PREFLIGHT_CHUNK_USE_BGE_LARGE", "0") == "1"
+
 # Lexical explicit-memory channels: inject three targeted candidate channels
 # into the broad pool before RRF/GBM reranking:
 #   A) Person-name: facts containing capitalised name tokens from the question.
@@ -477,10 +490,15 @@ def iter_qa(sample: dict):
 # the full project corpus with pure cosine similarity, no row cap.
 
 def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5) -> list[dict]:
-    """Search ALL live facts for project via RRF(cosine + BM25) — no row limit.
+    """Search ALL live facts for project via RRF(cosine + BM25 + chunk) — no row limit.
 
     Mirrors the run_recall_eval ranker so F1 evaluation uses the same retrieval
     signal as recall evaluation.  Returns list of dicts with 'id' and 'content'.
+
+    v25+ chunk signal (opt-in via PREFLIGHT_USE_CHUNK_RRF=1): embeds the query
+    with bge-large (1024d), cosine-ranks all chunks for the project, and maps
+    each top chunk to its constituent fact_ids via content matching.  Mapped
+    fact_ids get an RRF contribution so a chunk hit boosts its facts.
     """
     from utils import embed_text as _ue, cosine_similarity as _cs  # noqa: PLC0415
     q_emb = _ue(question)
@@ -540,19 +558,129 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
                     rank += 1
     except Exception:
         pass
+
+    # v25+ chunk RRF signal.  Opt-in; silent no-op when chunk_docs is empty
+    # or the chunk embedder (bge-large) is unavailable.
+    chunk_rank_by_fid: dict[int, int] = {}
+    if _USE_CHUNK_RRF:
+        chunk_rank_by_fid = _compute_chunk_rank(
+            conn, project_id, question, _ue, _cs,
+        )
     conn.close()
 
-    # RRF merge — weight controlled by _BM25_RRF_WEIGHT (baseline=1.0).
+    # RRF merge — weights controlled by _BM25_RRF_WEIGHT and _CHUNK_RRF_W.
     rrf: dict[int, float] = {}
     for fid, _, _e in fact_cache:
         s = 1.0 / (_RRF_K + cos_rank.get(fid, n_facts))
         if fid in bm25_rank:
             s += _BM25_RRF_WEIGHT / (_RRF_K + bm25_rank[fid])
+        if fid in chunk_rank_by_fid:
+            s += _CHUNK_RRF_W / (_RRF_K + chunk_rank_by_fid[fid])
         rrf[fid] = s
 
     content_by_fid = {fid: content for fid, content, _e in fact_cache}
     sorted_fids = sorted(rrf, key=rrf.__getitem__, reverse=True)
     return [{"id": fid, "content": content_by_fid[fid]} for fid in sorted_fids[:top_n]]
+
+
+def _compute_chunk_rank(
+    conn: sqlite3.Connection,
+    project_id: str,
+    question: str,
+    _ue,  # callable: text -> list[float]
+    _cs,  # callable: (a, b) -> float
+) -> dict[int, int]:
+    """v25+ chunk RRF signal.  Returns {fact_id: chunk_rank} for top-_CHUNK_TOP_K
+    chunks mapped to their constituent fact_ids.  Silent no-op on any failure
+    (missing chunks, dim mismatch, etc.) so callers can call unconditionally.
+
+    Used by both _eval_retrieve() and run_recall_eval() so the chunk signal
+    is consistent across F1 and recall evaluation paths.
+
+    v25+ Phase 3: when PREFLIGHT_CHUNK_USE_BGE_LARGE=1, query embedding uses
+    bge-large (1024d) regardless of ENGRAM_EMBED_MODEL, matching the chunk
+    embedding dim.  This is the dedicated chunk embedder; falls back to _ue
+    if bge-large load fails.
+    """
+    out: dict[int, int] = {}
+    if not _USE_CHUNK_RRF:
+        return out
+    try:
+        # v25+ Phase 3: prefer bge-large for chunk query embedding
+        _q_emb = None
+        if _CHUNK_USE_BGE_LARGE:
+            try:
+                from utils import embed_text_bge_large as _qet_bl  # type: ignore  # noqa: PLC0415
+                _q_emb = _qet_bl(question)
+            except Exception:
+                _q_emb = None
+        if _q_emb is None:
+            _q_emb = _ue(question)
+        _chunk_rows = conn.execute(
+            "SELECT id, embedding FROM chunk_docs "
+            "WHERE project_id = ? AND embedding IS NOT NULL",
+            (project_id,),
+        ).fetchall()
+        if not _chunk_rows or not _q_emb:
+            return out
+        _cids: list[int] = []
+        _cembs: list[list[float]] = []
+        for _cid, _cblob in _chunk_rows:
+            if _cblob is None:
+                continue
+            if isinstance(_cblob, (bytes, bytearray)):
+                _cn = len(_cblob) // 4
+                if _cn == len(_q_emb):
+                    _cembs.append(list(struct.unpack(f"{_cn}f", _cblob)))
+                    _cids.append(_cid)
+            elif isinstance(_cblob, str):
+                try:
+                    _v = json.loads(_cblob)
+                    if len(_v) == len(_q_emb):
+                        _cembs.append(_v)
+                        _cids.append(_cid)
+                except Exception:
+                    pass
+        if not _cembs:
+            return out
+        _pairs = sorted(
+            ((_cids[i], _cs(_q_emb, _cembs[i])) for i in range(len(_cembs))),
+            key=lambda x: x[1], reverse=True,
+        )[:_CHUNK_TOP_K]
+        # Build fact lookup: window rows expose [curr] sub-line, turn rows
+        # expose bare "Speaker: text".  Index both forms.
+        _fact_lookup: dict[str, list[int]] = {}
+        for _fid, _content in conn.execute(
+            "SELECT id, content FROM facts "
+            "WHERE project_id = ? AND superseded_at IS NULL",
+            (project_id,),
+        ).fetchall():
+            for _line in _content.split("\n"):
+                for _tag in ("[curr] ", "[prev] ", "[next] "):
+                    if _line.startswith(_tag):
+                        _fact_lookup.setdefault(_line[len(_tag):], []).append(_fid)
+                        break
+                else:
+                    if _line.strip():
+                        _fact_lookup.setdefault(_line.strip(), []).append(_fid)
+        # Map chunk -> fact_ids (content match), accumulate best rank
+        for _rank, (_cid, _sim) in enumerate(_pairs):
+            _cc = conn.execute(
+                "SELECT content FROM chunk_docs WHERE id = ?", (_cid,)
+            ).fetchone()
+            if not _cc:
+                continue
+            _body = re.sub(r"^\s*\[[^\]]+\]\s*", "", _cc[0])
+            for _line in _body.split("\n"):
+                _line = _line.strip()
+                if not _line:
+                    continue
+                for _fid in _fact_lookup.get(_line, []):
+                    if _fid not in out or _rank < out[_fid]:
+                        out[_fid] = _rank
+    except Exception:
+        return out
+    return out
 
 
 def build_dia_id_map(samples: list, db_path: str) -> dict:
@@ -742,6 +870,16 @@ def ingest(samples: list, mem, mode: str) -> dict:
                             kw_facts += 1
                     except Exception:
                         pass
+
+            # v25+ hybrid: parallel chunked turn storage (Nitin pattern).
+            # Opt-in via PREFLIGHT_CHUNK_STORE=1.  Called once per session
+            # (not per turn) so each 6-turn chunk captures conversational
+            # context.  Multi-hop Qs can match the chunk in one ANN hit.
+            if session_turns:
+                try:
+                    mem.store_session_chunks(pid, sid, session_turns, timestamp=_date)
+                except Exception:
+                    pass  # never let chunk-store errors break fact ingest
     return {"total_turns": total_turns, "kw_facts": kw_facts}
 
 
@@ -1360,6 +1498,16 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                 except Exception:
                     pass
 
+                # v25+ chunk RRF signal (opt-in).  Maps top-K chunks back to
+                # their fact_ids via content matching; mapped facts get a
+                # _CHUNK_RRF_W / (K + rank) contribution.  Reuses the batched
+                # q_emb we already have above.
+                chunk_rank_by_fid_eval: dict[int, int] = {}
+                if _USE_CHUNK_RRF:
+                    chunk_rank_by_fid_eval = _compute_chunk_rank(
+                        conn, pid, qa["question"], _ue, _cs,
+                    )
+
                 # RRF merge: per-signal K values — cosine uses tighter K (rank
                 # dominates), BM25 uses looser K (avoids over-penalising sparse
                 # token matches).  Override via PREFLIGHT_RRF_K_COS / _BM25.
@@ -1371,6 +1519,8 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                         s += _BM25_RRF_WEIGHT / (_RRF_K_BM25 + bm25_rank_eval[fid])
                     if _USE_CONTEXT_BM25 and fid in context_bm25_rank_eval:
                         s += _BM25_RRF_WEIGHT / (_RRF_K_BM25 + context_bm25_rank_eval[fid])
+                    if fid in chunk_rank_by_fid_eval:
+                        s += _CHUNK_RRF_W / (_RRF_K_BM25 + chunk_rank_by_fid_eval[fid])
                     rrf_scores[fid] = s
                 if _USE_DERIVED_BM25:
                     derived_rank_eval: dict[int, int] = {}

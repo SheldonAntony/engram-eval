@@ -135,14 +135,26 @@ if args.reingest:
     _stats = ev.ingest(samples, _mem, mode="B")
     print(f"  Done in {time.time()-_t_ingest:.1f}s  "
           f"turns={_stats['total_turns']}  kw-facts={_stats['kw_facts']}")
-    # Report llm_atomic counts if any
+    # Report llm_atomic + chunk counts if any
     import sqlite3 as _sq
     _con = _sq.connect(DB_PATH)
     _llm_cnt = _con.execute(
         "SELECT COUNT(*) FROM facts WHERE fact_type='llm_atomic'"
     ).fetchone()[0]
+    # v25+ populate chunk_docs_fts mirror so the chunk BM25 channel works.
+    # ensure_chunk_fts() is a no-op when chunk storage is disabled.
+    try:
+        _n_chunks_fts = _mem.ensure_chunk_fts()
+    except Exception:
+        _n_chunks_fts = 0
+    try:
+        _n_chunks = _con.execute("SELECT COUNT(*) FROM chunk_docs").fetchone()[0]
+    except Exception:
+        _n_chunks = 0
     _con.close()
-    print(f"  llm_atomic facts stored: {_llm_cnt}\n")
+    print(f"  llm_atomic facts stored: {_llm_cnt}")
+    print(f"  chunk_docs stored:      {_n_chunks}")
+    print(f"  chunk_docs_fts rows:    {_n_chunks_fts}\n")
 elif not os.path.exists(DB_PATH):
     print(f"ERROR: {DB_PATH} not found.")
     print("Run 'python eval_locomo.py' first, or use --reingest to create a fresh DB.")
