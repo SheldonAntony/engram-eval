@@ -1145,3 +1145,128 @@ Production path now matches internal eval path exactly (74.5% vs 74.40% R@5), pr
 2. Enable CE reranker (mxbai-rerank-xsmall-v1, pool=80, timeout=10s) and measure R@5 delta
 3. Tune composite scoring weights for production mode
 4. Run full production benchmark (all signals, CE) to beat 74.5% R@5
+
+---
+
+## 11. Nitin-Beating Attempt (2026-06-10)
+
+### Goal
+Beat Nitin Gupta's engram R@5 (93.9% on LoCoMo) by porting his architectural wins into our codebase.
+
+### What Was Implemented
+1. **bge-large embeddings** — `ENGRAM_BGE_LARGE=1` enables `BAAI/bge-large-en-v1.5` (1024d) via fastembed
+2. **Query prefix** — `_prepare_query()` adds "Represent this sentence for searching relevant passages: " to queries
+3. **6-turn overlapping windows** — `_store_turn_window_6()` stores [prev2/prev1/curr/next1/next2/next3] context
+4. **Timestamp prefix** — `[Date: ...]` prepended to window content for temporal questions
+5. **Speaker name injection** — `[Speaker: ...]` prepended for better entity matching
+6. **Synthetic docs** — `_generate_synthetic_docs()` extracts preferences/topics from conversation turns
+7. **Simplified pipeline** — `PREFLIGHT_USE_CE=1`, `PREFLIGHT_BROAD_POOL=200`, `PREFLIGHT_COVERAGE_K=40`
+8. **Batch embeddings** — `_ub(q_texts, is_query=True)` for all questions per conversation
+
+### Bugs Fixed
+- **Contradiction detection** — synthetic docs stored as `preference`/`summary` triggered `store_fact()` contradiction detection (line 1086 exclusion list). Fixed by storing synthetic docs as `fact_type="window"`.
+- **Missing import** — `embed_text` not imported in `_store_turn_window_6()`. Fixed with `from utils import embed_text as _embed_fn`.
+- **Wrong module reference** — `mem._store_derived_fts()` should be `_mem._store_derived_fts()` (module-level function).
+
+### Test Results
+- **Ingest test (1 conv)**: 474 facts, 0 superseded, 64s — contradiction fix confirmed working
+- **Full 10-conv recall eval (Nitin config)**: R@5=29.06%, R@40=79.84% — **catastrophic regression** from baseline ~83.89% R@5
+
+### Root Cause of Regression
+UNKNOWN — need to isolate which change caused the drop. Possible culprits:
+1. bge-large embeddings may not be compatible with our RRF scoring weights
+2. 6-turn windows may dilute per-turn precision
+3. Synthetic docs may add noise to retrieval
+4. Timestamp/speaker prefix may hurt cosine similarity
+
+### Root Cause Analysis (completed 2026-06-10)
+
+**Bug found**: `embed_texts_batch()` doesn't accept `is_query` parameter — all Nitin-beating calls silently failed, storing facts with `None` embeddings. Fixed by removing `is_query` from all calls.
+
+**Ablation results (conv 1 only, R@5):**
+
+| Config | R@5 | R@40 | Notes |
+|--------|-----|------|-------|
+| bge-small, 3-turn, no prefix (baseline) | **83.9%** | 94.0% | Clean baseline |
+| bge-base, 3-turn, no prefix | **84.6%** | 95.3% | +0.7 points |
+| bge-small + CE (ms-marco-MiniLM) | **86.6%** | 96.6% | +2.7 points |
+| bge-large (fastembed), 3-turn | 38.9% | 89.9% | **BROKEN** — fastembed ONNX conversion garbage |
+| bge-large (sentence-transformers), 3-turn, query prefix | 81.9% | 97.3% | Worse than bge-small on R@5 |
+| bge-large + full Nitin config (6-turn, prefix, synthetic) | 71.1% | 96.3% | 6-turn windows hurt |
+| bge-small + full Nitin config | 63.2% | 92.5% | 6-turn + prefix hurt |
+
+**Key findings:**
+1. **fastembed bge-large is broken** — produces garbage embeddings. Must use sentence-transformers or bge-small/base.
+2. **6-turn windows hurt** — more context dilutes per-turn precision. 3-turn is optimal.
+3. **Timestamp/speaker prefix hurts** — adds noise to cosine similarity.
+4. **Query prefix doesn't help bge-small** — R@5 drops from 83.9% to 82.6%.
+5. **RRF_K=15 is optimal** — already the default.
+6. **CE adds +2.7 points** — biggest single lever, but slow on CPU.
+7. **bge-base is marginally better** than bge-small (+0.7 points).
+
+### Status: NEEDS MORE WORK — target 95% R@5 unreachable with current approach
+
+**Gap to target:** 86.6% → 95% = +8.4 percentage points needed.
+
+**What would close the gap:**
+1. Stronger cross-encoder (e.g., bge-reranker-v2-m3) — too slow on CPU
+2. Better initial retrieval (more signals: lexical, context BM25, derived BM25)
+3. Query expansion / paraphrase retrieval
+4. Ensemble of multiple retrieval strategies
+
+### Files Modified (reverted)
+- `/mnt/c/Users/Sheldon Antony/.config/preflight/eval_locomo.py` — reverted to clean state
+- `/home/sheldon_antony/.config/opencode/utils.py` — already had bge-large support (no changes needed)
+
+---
+
+## 12. Production Speed Fix & Full Benchmark Results (2026-06-10)
+
+### Problem
+Production `retrieve_facts()` took **5s per query** — 97% spent in Python `sum()` inside `cosine_similarity()` called 108K times.
+
+### Fix Applied
+**memory.py:2132** — Replaced per-pair `cosine_similarity()` with numpy batch matmul:
+```python
+_cos_scores = _embs_normed @ _qvec  # single matrix multiply
+```
+
+**memory.py:2760** — Vectorized MMR loop with numpy (greedy selection using pre-computed cosine scores).
+
+### Result
+- **Before:** 5.0s/query (108K Python `sum()` calls)
+- **After:** 0.35s/query (numpy batch operations)
+- **Speedup:** 14x
+
+### Bug Fixed
+MMR section returned `(0, fid)` tuples but downstream expected `(score, fid, content, ef, lra, rc)`. Fixed by preserving original row data: `[_fid_to_row[fid] for fid in mmr_fids_ordered]`.
+
+### Full 10-Conv Benchmark Results
+
+| Config | R@1 | R@3 | R@5 | R@10 | R@40 |
+|--------|-----|-----|-----|------|------|
+| **RRF_K=15, no CE** | 48.82% | 67.87% | **74.90%** | 84.43% | 93.69% |
+| **RRF_K=30, no CE** | 47.75% | 67.54% | 74.31% | 83.64% | 93.89% |
+| **RRF_K=60, no CE** | 48.09% | 66.95% | 74.38% | 82.98% | 93.17% |
+| **RRF_K=15 + Nitin boosts** | 48.82% | 67.87% | **74.90%** | 84.43% | 93.69% |
+| **RRF_K=15 + all Nitin** | 45.53% | 67.08% | 74.57% | 84.03% | 93.56% |
+| **Previous v19 (no CE)** | 49.25% | 68.91% | 75.18% | 82.36% | 92.88% |
+| **Previous v19 (xsmall CE)** | 57.48% | 77.20% | **82.95%** | 88.83% | 95.36% |
+
+### Key Findings
+1. **RRF_K=15 is optimal** — K=15 beats K=30 and K=60 on R@5
+2. **Nitin boosts don't help** — Same R@5 (74.90%) with or without `ENGRAM_USE_NITIN_BOOSTS=1`
+3. **All Nitin features combined slightly hurt** — R@5 drops from 74.90% to 74.57%
+4. **CE is the biggest lever** — v19 with CE: 82.95% vs without: 75.18% (+7.77 points)
+5. **Current R@5 plateau: ~75% without CE, ~83% with CE**
+6. **Gap to Nitin's 93.9%: ~11 percentage points** — requires fundamentally different approach
+
+### What Would Close the Gap
+1. **Stronger cross-encoder** — bge-reranker-v2-m3 (too slow on CPU currently)
+2. **Query decomposition** — break complex questions into sub-queries
+3. **HyDE** — hypothetical document expansion for better query matching
+4. **Conversation-context BM25** — index neighboring turns for multi-hop questions
+5. **Ensemble of multiple retrieval strategies** — combine cosine, BM25, lexical, context signals
+
+### Files Modified
+- `/home/sheldon_antony/.config/opencode/memory.py` — numpy batch matmul for cosine_similarity + MMR vectorization
